@@ -19,13 +19,16 @@ class Signal:
     strength: float  # 0.0–1.0 raw signal confidence
     edge: float  # estimated edge in percentage points
     strategy_name: str
-    market_id: str  # Polymarket contract/token identifier
-    city: str
+    market_id: str  # Polymarket condition_id
+    token_id: str  # Polymarket token_id for the specific outcome
+    market_slug: str  # Human-readable market identifier
+    category: str  # "politics", "sports", "crypto", "macro", "other"
+    outcome: str  # The outcome being traded (e.g., "Yes", "Trump", etc.)
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
 class BaseStrategy(ABC):
-    """Abstract base for all weather arbitrage strategies."""
+    """Abstract base for all arbitrage strategies."""
 
     @property
     @abstractmethod
@@ -40,16 +43,21 @@ class BaseStrategy(ABC):
         Args:
             market_data: Dict containing at minimum:
                 - timestamp: current evaluation time
-                - city: target city key
-                - market_id: Polymarket contract id
-                - market_price: current CLOB mid price (0-1)
-                - model_prob: model-derived fair probability (0-1)
-                - forecast_high_f: NOAA forecasted high
-                - forecast_shift_f: change since last model run
-                - book_depth: USD depth at top of book
+                - market_id: Polymarket condition_id
+                - token_id: token for the specific outcome
+                - market_slug: human-readable slug
+                - category: market category
+                - question: full market question text
+                - outcome: outcome label
+                - yes_price: current YES price (0-1)
+                - no_price: current NO price (0-1)
+                - mid_price: (yes_price + no_price) / 2 or best estimate
                 - spread: bid-ask spread
-                - volume_24h: 24h volume
-                - lead_days: days until resolution
+                - book_depth: USD depth at top of book
+                - volume_24h: 24h volume in USD
+                - liquidity: total liquidity
+                - time_to_resolution_hrs: hours until expiry
+                - has_position: whether we hold this token
                 Plus strategy-specific fields documented per implementation.
 
         Returns:

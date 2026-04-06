@@ -1,23 +1,37 @@
-"""Multi-strategy weather arbitrage framework.
+"""Multi-strategy Polymarket arbitrage framework.
 
-Provides a BaseStrategy interface and four weather-specific implementations:
-forecast arbitrage, mean reversion, forecast momentum, and cross-city arb.
-An ensemble combiner blends signals with regime-adaptive weights.
+Market-agnostic strategies that scan the full Polymarket universe
+for structural mispricing, cross-market contradictions, volume
+divergences, stale markets, and line movement.
 """
 
 from strategies.base import BaseStrategy, Signal
-from strategies.forecast_arb import ForecastArbStrategy
+from strategies.implied_prob_arb import ImpliedProbArbStrategy
+from strategies.cross_market_arb import CrossMarketArbStrategy
+from strategies.volume_divergence import VolumeDivergenceStrategy
+from strategies.stale_market import StaleMarketStrategy
+from strategies.line_movement import LineMovementStrategy
 from strategies.mean_reversion import MeanReversionStrategy
-from strategies.forecast_momentum import ForecastMomentumStrategy
-from strategies.cross_city_arb import CrossCityArbStrategy
 from strategies.ensemble import EnsembleStrategy
+
+ALL_STRATEGIES = {
+    "implied_prob_arb": ImpliedProbArbStrategy,
+    "cross_market_arb": CrossMarketArbStrategy,
+    "volume_divergence": VolumeDivergenceStrategy,
+    "stale_market": StaleMarketStrategy,
+    "line_movement": LineMovementStrategy,
+    "mean_reversion": MeanReversionStrategy,
+}
 
 __all__ = [
     "BaseStrategy",
     "Signal",
-    "ForecastArbStrategy",
+    "ImpliedProbArbStrategy",
+    "CrossMarketArbStrategy",
+    "VolumeDivergenceStrategy",
+    "StaleMarketStrategy",
+    "LineMovementStrategy",
     "MeanReversionStrategy",
-    "ForecastMomentumStrategy",
-    "CrossCityArbStrategy",
     "EnsembleStrategy",
+    "ALL_STRATEGIES",
 ]

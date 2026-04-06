@@ -1,6 +1,7 @@
 """Risk management: Kelly sizing, position limits, and kill switch.
 
 All trade proposals pass through the risk manager before execution.
+Works with the strategies.base.Signal type (market-agnostic).
 """
 
 from __future__ import annotations
@@ -11,7 +12,7 @@ from datetime import datetime, timezone
 from typing import Callable, Any
 
 from config import settings
-from core.signal_engine import Signal
+from strategies.base import Signal
 
 logger = logging.getLogger(__name__)
 
@@ -31,7 +32,7 @@ class RiskManager:
     def __init__(self, starting_capital: float) -> None:
         self._starting_capital = starting_capital
         self._available_cash: float = starting_capital
-        self._open_positions: dict[str, float] = {}  # contract_id -> size_usd
+        self._open_positions: dict[str, float] = {}
         self._trades_this_cycle: int = 0
         self._session_pnl: float = 0.0
         self._peak_value: float = starting_capital
@@ -77,64 +78,59 @@ class RiskManager:
         self._peak_value = max(self._peak_value, portfolio_value)
         self._check_drawdown(portfolio_value)
 
-    def evaluate(self, signal: Signal) -> TradeProposal:
-        """Evaluate a signal and return a sized trade proposal.
+    def evaluate_signal(self, signal: Signal) -> TradeProposal | None:
+        """Evaluate a strategies.base.Signal and return a sized TradeProposal.
 
         Args:
-            signal: The BUY or SELL signal to evaluate.
+            signal: Signal from any strategy.
 
         Returns:
-            TradeProposal with approved=True/False and sizing.
+            TradeProposal if approved, None if rejected.
         """
         if self._kill_switch_active:
-            return self._reject(signal, "Kill switch active")
+            return None
 
-        if signal.signal_type == "SELL":
-            size = self._open_positions.get(signal.contract_id, 0.0)
+        token_id = signal.token_id or signal.market_id
+
+        if signal.direction == "SELL":
+            size = self._open_positions.get(token_id, 0.0)
+            if size <= 0:
+                return None
             return TradeProposal(
                 signal=signal,
                 size_usd=size,
                 kelly_fraction=0.0,
-                approved=size > 0,
-                reject_reason="" if size > 0 else "No open position",
+                approved=True,
+                reject_reason="",
             )
 
         # BUY entry filters
-        if signal.confidence < settings.MIN_CONFIDENCE:
-            return self._reject(signal, f"Confidence {signal.confidence:.2f} < {settings.MIN_CONFIDENCE}")
+        if signal.strength < settings.MIN_CONFIDENCE:
+            return None
 
-        existing_size = self._open_positions.get(signal.contract_id, 0.0)
-        if existing_size >= settings.MAX_POSITION_USD:
-            return self._reject(signal, f"Position limit reached: ${existing_size:.2f}")
+        if signal.edge < settings.MIN_EDGE:
+            return None
+
+        existing = self._open_positions.get(token_id, 0.0)
+        if existing >= settings.MAX_POSITION_USD:
+            return None
 
         if len(self._open_positions) >= settings.MAX_OPEN_POSITIONS:
-            return self._reject(signal, f"Max open positions ({settings.MAX_OPEN_POSITIONS}) reached")
+            return None
 
         if self._trades_this_cycle >= settings.MAX_TRADES_PER_RUN:
-            return self._reject(signal, f"Max trades per cycle ({settings.MAX_TRADES_PER_RUN}) reached")
-
-        if signal.signal_type == "BUY":
-            ttl_hrs = 0.0
-            snap_data = getattr(signal, "time_to_resolution_hrs", None)
-            if snap_data is None:
-                from datetime import timedelta
-                ttl_hrs = (
-                    datetime.combine(signal.target_date, datetime.max.time()).replace(tzinfo=timezone.utc)
-                    - datetime.now(timezone.utc)
-                ).total_seconds() / 3600.0
-            if ttl_hrs < settings.MIN_TTL_HOURS:
-                return self._reject(signal, f"TTL {ttl_hrs:.1f}h < {settings.MIN_TTL_HOURS}h")
+            return None
 
         # Half-Kelly sizing
         kelly, size = self._compute_kelly_size(signal)
         if kelly <= 0:
-            return self._reject(signal, f"Kelly fraction non-positive: {kelly:.4f}")
+            return None
 
         size = min(size, self._available_cash)
-        size = min(size, settings.MAX_POSITION_USD - existing_size)
+        size = min(size, settings.MAX_POSITION_USD - existing)
 
         if size < settings.MIN_TRADE_SIZE:
-            return self._reject(signal, f"Size ${size:.2f} below minimum ${settings.MIN_TRADE_SIZE}")
+            return None
 
         self._trades_this_cycle += 1
         return TradeProposal(
@@ -145,23 +141,39 @@ class RiskManager:
             reject_reason="",
         )
 
-    def _compute_kelly_size(self, signal: Signal) -> tuple[float, float]:
-        """Compute half-Kelly position size.
+    # Keep backwards-compatible evaluate() for backtest engine
+    def evaluate(self, signal: Any) -> TradeProposal:
+        """Legacy evaluate for backtest engine compatibility."""
+        result = self.evaluate_signal(signal) if isinstance(signal, Signal) else None
+        if result:
+            return result
+        return TradeProposal(
+            signal=signal,
+            size_usd=0.0,
+            kelly_fraction=0.0,
+            approved=False,
+            reject_reason="Rejected",
+        )
 
-        Returns:
-            (kelly_fraction, dollar_size)
-        """
-        if signal.market_price <= 0 or signal.market_price >= 1:
+    def _compute_kelly_size(self, signal: Signal) -> tuple[float, float]:
+        """Compute half-Kelly position size from signal edge + strength."""
+        # Use signal strength as probability estimate, edge as information
+        p = signal.strength
+        market_price = 1.0 - signal.edge  # Approximate market price from edge
+        if market_price <= 0 or market_price >= 1:
+            # Fall back to using metadata if available
+            market_price = signal.metadata.get("mid_price", signal.metadata.get("yes_price", 0.5))
+
+        if market_price <= 0 or market_price >= 1:
             return 0.0, 0.0
 
-        odds = (1.0 / signal.market_price) - 1.0
+        odds = (1.0 / market_price) - 1.0
         if odds <= 0:
             return 0.0, 0.0
 
-        p = signal.model_prob
         q = 1.0 - p
         kelly = (p * odds - q) / odds
-        kelly *= settings.KELLY_FRACTION  # half-Kelly
+        kelly *= settings.KELLY_FRACTION
 
         if kelly <= 0:
             return kelly, 0.0
@@ -178,7 +190,7 @@ class RiskManager:
         for level in settings.DRAWDOWN_WARNING_LEVELS:
             if drawdown >= level and level not in self._drawdown_alerts_sent:
                 self._drawdown_alerts_sent.add(level)
-                logger.warning("Drawdown warning: %.1f%% (threshold: %.1f%%)", drawdown * 100, level * 100)
+                logger.warning("Drawdown warning: %.1f%%", drawdown * 100)
                 for cb in self._drawdown_callbacks:
                     try:
                         cb(drawdown)
@@ -187,14 +199,3 @@ class RiskManager:
 
         if drawdown >= settings.MAX_DAILY_DRAWDOWN:
             self.activate_kill_switch()
-
-    @staticmethod
-    def _reject(signal: Signal, reason: str) -> TradeProposal:
-        logger.debug("REJECT %s %s %s: %s", signal.signal_type, signal.location, signal.bucket_label, reason)
-        return TradeProposal(
-            signal=signal,
-            size_usd=0.0,
-            kelly_fraction=0.0,
-            approved=False,
-            reject_reason=reason,
-        )
