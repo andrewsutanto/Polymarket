@@ -2,7 +2,7 @@ __pycache__/
 *.pyc
 .env
 config/secrets.py
-data/
+data/cache/
 logs/
 .venv/
 venv/
@@ -12,3 +12,4 @@ dist/
 build/
 .mypy_cache/
 .pytest_cache/
+results/
