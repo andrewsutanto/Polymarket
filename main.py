@@ -1,8 +1,7 @@
 """Entrypoint and async orchestrator for the weather arbitrage bot.
 
-Coordinates all components: NOAA feeds, Polymarket polling, Falcon
-enrichment, signal engine, risk manager, executor, portfolio tracker,
-database, Telegram alerts, and the terminal dashboard.
+Coordinates all components with Telegram as the sole UI. No terminal
+dashboard — everything is controlled and monitored through Telegram.
 """
 
 from __future__ import annotations
@@ -10,10 +9,13 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import logging.handlers
 import os
+import re
 import signal
 import sys
 from datetime import datetime, timezone
+from typing import Any
 
 from dotenv import load_dotenv
 
@@ -30,8 +32,13 @@ from core.risk_manager import RiskManager
 from core.executor import Executor, TradeResult
 from core.portfolio import Portfolio
 from infra.database import Database
-from infra.telegram import TelegramService
-from infra.dashboard import Dashboard
+from infra.telegram import TelegramUI
+from infra.charts import (
+    generate_pnl_chart,
+    generate_forecast_chart,
+    generate_positions_chart,
+    generate_win_rate_chart,
+)
 
 logger = logging.getLogger("weather_arb")
 
@@ -50,13 +57,10 @@ def setup_logging() -> None:
     logging.basicConfig(level=logging.INFO, format=fmt, handlers=handlers)
 
 
-import logging.handlers
-
-
 class Bot:
-    """Main orchestrator that ties all components together."""
+    """Main orchestrator — Telegram is the sole UI."""
 
-    def __init__(self, live_flag: bool = False, no_dashboard: bool = False) -> None:
+    def __init__(self, live_flag: bool = False) -> None:
         self.noaa = NOAAFeed()
         self.model = WeatherModel()
         self.polymarket = PolymarketFeed()
@@ -65,10 +69,8 @@ class Bot:
         self.risk = RiskManager(settings.STARTING_CAPITAL)
         self.executor = Executor(live_cli_flag=live_flag)
         self.db = Database()
-        self.telegram = TelegramService()
-        self.dashboard = Dashboard(mode=self.executor.mode)
+        self.telegram = TelegramUI()
         self.signal_engine = SignalEngine(self.noaa, self.model, self.polymarket, self.falcon)
-        self._no_dashboard = no_dashboard
         self._running = False
 
     async def start(self) -> None:
@@ -77,52 +79,47 @@ class Bot:
         # 1. Database
         await self.db.start()
 
-        # 2. Telegram
-        await self.telegram.start()
+        # 2. Register Telegram commands BEFORE starting (handlers must exist first)
         self._register_telegram_commands()
 
-        # 3. NOAA grid resolution + initial forecasts
+        # 3. Telegram
+        await self.telegram.start()
+
+        # 4. NOAA grid resolution + initial forecasts
         await self.noaa.start()
         self._register_noaa_callbacks()
 
-        # 4. Polymarket contract discovery
+        # 5. Polymarket contract discovery
         await self.polymarket.start()
 
-        # 5. Register bucket definitions
+        # 6. Register bucket definitions
         bucket_defs = self.polymarket.get_bucket_defs()
         self.model.register_buckets(bucket_defs)
 
-        # 6. Falcon
+        # 7. Falcon
         await self.falcon.start()
 
-        # 7. Executor
+        # 8. Executor
         await self.executor.start()
         self.executor.on_trade(self._on_trade)
 
-        # 8. Risk manager callbacks
+        # 9. Risk manager callbacks
         self.risk.on_kill_switch(self._on_kill_switch)
         self.risk.on_drawdown_warning(self._on_drawdown_warning)
 
-        # 9. Signal engine callbacks
+        # 10. Signal engine callbacks
         self.signal_engine.on_signal(self._on_signal)
 
         self._running = True
 
-        # Print mode banner
-        if self.executor.is_live:
-            print("\n" + "=" * 50)
-            print("  === RUNNING IN LIVE MODE ===")
-            print("=" * 50 + "\n")
-        else:
-            print("\n" + "=" * 50)
-            print("  === RUNNING IN PAPER MODE ===")
-            print("=" * 50 + "\n")
-
-        await self.telegram.send_message(
-            f"Bot started in {self.executor.mode} mode\n"
-            f"Capital: ${settings.STARTING_CAPITAL}\n"
-            f"Locations: {', '.join(LOCATIONS.keys())}"
+        # Send startup message via Telegram
+        await self.telegram.send_startup_message(
+            mode=self.executor.mode,
+            capital=settings.STARTING_CAPITAL,
+            locations=list(LOCATIONS.keys()),
         )
+
+        logger.info("Bot started in %s mode", self.executor.mode)
 
     async def run(self) -> None:
         await self.start()
@@ -137,6 +134,7 @@ class Bot:
             asyncio.create_task(self._scan_loop(), name="signal_scan"),
             asyncio.create_task(self._snapshot_loop(), name="snapshots"),
             asyncio.create_task(self._bucket_refresh_loop(), name="bucket_refresh"),
+            asyncio.create_task(self.telegram.run_polling(), name="tg_polling"),
         ]
 
         if self.falcon.is_enabled:
@@ -145,12 +143,6 @@ class Bot:
                 asyncio.create_task(self.falcon.run_sentiment_loop(), name="falcon_sent"),
                 asyncio.create_task(self.falcon.run_cross_market_loop(), name="falcon_cm"),
             ])
-
-        if self.telegram.is_enabled:
-            tasks.append(asyncio.create_task(self.telegram.run_command_loop(), name="tg_commands"))
-
-        if not self._no_dashboard:
-            tasks.append(asyncio.create_task(self.dashboard.run(), name="dashboard"))
 
         try:
             await asyncio.gather(*tasks)
@@ -162,7 +154,6 @@ class Bot:
     async def shutdown(self) -> None:
         logger.info("Shutting down...")
         self._running = False
-        self.dashboard.stop()
 
         stats = self.portfolio.get_stats()
         await self.telegram.send_daily_summary(stats)
@@ -191,7 +182,6 @@ class Bot:
                     portfolio_value=self.portfolio.get_portfolio_value(),
                 )
 
-                # Re-register buckets in case new contracts appeared
                 bucket_defs = self.polymarket.get_bucket_defs()
                 if bucket_defs:
                     self.model.register_buckets(bucket_defs)
@@ -205,7 +195,7 @@ class Bot:
                         if result:
                             self.portfolio.process_trade(result)
                     else:
-                        self.dashboard.log_signal(
+                        self.telegram.log_signal(
                             f"{sig.location} {sig.bucket_label} "
                             f"edge={sig.edge*100:.0f}% conf={sig.confidence:.2f} "
                             f"-> SKIP ({proposal.reject_reason})"
@@ -217,9 +207,6 @@ class Bot:
                     for cid, snap in self.polymarket.get_all_snapshots().items()
                 }
                 self.portfolio.mark_to_market(prices)
-
-                # Update dashboard
-                self._refresh_dashboard()
 
             except Exception:
                 logger.exception("Error in scan loop")
@@ -242,7 +229,6 @@ class Bot:
             await asyncio.sleep(settings.SNAPSHOT_INTERVAL)
 
     async def _bucket_refresh_loop(self) -> None:
-        """Periodically refresh bucket defs from newly discovered contracts."""
         while self._running:
             await asyncio.sleep(settings.CONTRACT_SCAN_INTERVAL)
             try:
@@ -253,7 +239,7 @@ class Bot:
                 logger.exception("Bucket refresh error")
 
     # ------------------------------------------------------------------
-    # Callbacks
+    # NOAA callbacks
     # ------------------------------------------------------------------
 
     def _register_noaa_callbacks(self) -> None:
@@ -280,7 +266,7 @@ class Bot:
                 shift=evt.shift_f,
                 model_run=evt.model_run_time.strftime("%Hz"),
             ))
-            self.dashboard.log_signal(
+            self.telegram.log_signal(
                 f"SHIFT {evt.location} {evt.target_date}: "
                 f"{evt.old_high_f:.0f} -> {evt.new_high_f:.0f}°F ({evt.shift_f:+.0f}°F)"
             )
@@ -289,16 +275,14 @@ class Bot:
         self.noaa.on_shift(on_shift)
 
     def _on_signal(self, sig: Signal) -> None:
-        self.dashboard.log_signal(
+        self.telegram.log_signal(
             f"{sig.location} {sig.bucket_label} "
             f"edge={sig.edge*100:.0f}% conf={sig.confidence:.2f} "
             f"ratio={sig.value_ratio:.1f}x -> {sig.signal_type}"
         )
 
     def _on_trade(self, result: TradeResult) -> None:
-        # Parse bucket boundaries from label
-        import re
-        m = re.search(r"(\d+)\s*[-–]\s*(\d+)", result.bucket_label)
+        m = re.search(r"(\d+)\s*[-\u2013]\s*(\d+)", result.bucket_label)
         low_f = int(m.group(1)) if m else 0
         high_f = int(m.group(2)) if m else 0
 
@@ -349,135 +333,265 @@ class Bot:
         asyncio.create_task(self.telegram.alert_drawdown(drawdown))
 
     # ------------------------------------------------------------------
-    # Telegram commands
+    # Telegram command handlers (all async, return (text, image|None))
     # ------------------------------------------------------------------
 
     def _register_telegram_commands(self) -> None:
-        self.telegram.register_command("/status", self._cmd_status)
-        self.telegram.register_command("/kill", self._cmd_kill)
-        self.telegram.register_command("/trades", self._cmd_trades)
-        self.telegram.register_command("/pnl", self._cmd_pnl)
-        self.telegram.register_command("/weather", self._cmd_weather)
-        self.telegram.register_command("/positions", self._cmd_positions)
+        self.telegram.register_command("start", self._cmd_start)
+        self.telegram.register_command("status", self._cmd_status)
+        self.telegram.register_command("positions", self._cmd_positions)
+        self.telegram.register_command("trades", self._cmd_trades)
+        self.telegram.register_command("pnl", self._cmd_pnl)
+        self.telegram.register_command("weather", self._cmd_weather)
+        self.telegram.register_command("forecast", self._cmd_forecast)
+        self.telegram.register_command("signals", self._cmd_signals)
+        self.telegram.register_command("settings", self._cmd_settings)
+        self.telegram.register_command("kill", self._cmd_kill)
+        self.telegram.register_command("resume", self._cmd_resume)
+        self.telegram.register_command("help", self._cmd_help)
+        self.telegram.register_callback("forecast", self._cb_forecast)
 
-    def _cmd_status(self) -> str:
+    async def _cmd_start(self) -> tuple[str, bytes | None]:
         stats = self.portfolio.get_stats()
-        return (
-            f"<b>Status</b>\n"
-            f"Mode: {self.executor.mode}\n"
+        text = (
+            "\U0001f321 <b>Weather Arb Bot</b>\n\n"
+            f"Mode: <b>{self.executor.mode}</b>\n"
             f"Portfolio: ${stats['portfolio_value']:.2f}\n"
+            f"Daily P&L: ${stats['daily_pnl']:+.2f}\n"
+            f"Open: {stats['open_positions']} positions\n\n"
+            "Tap a button below or use /help for all commands."
+        )
+        return text, None
+
+    async def _cmd_status(self) -> tuple[str, bytes | None]:
+        stats = self.portfolio.get_stats()
+        kill = "\U0001f534 ACTIVE" if self.risk.kill_switch_active else "\U0001f7e2 off"
+        falcon = "\U0001f7e2" if self.falcon.is_enabled else "\U0001f534"
+        text = (
+            "\U0001f4ca <b>STATUS</b>\n\n"
+            f"Mode: <b>{self.executor.mode}</b>\n"
+            f"Portfolio: <b>${stats['portfolio_value']:.2f}</b>\n"
             f"Cash: ${stats['cash']:.2f}\n"
             f"Daily P&L: ${stats['daily_pnl']:+.2f}\n"
-            f"Drawdown: {stats['drawdown']*100:.1f}%\n"
-            f"Open: {stats['open_positions']} | Trades: {stats['total_trades']}\n"
-            f"Win Rate: {stats['win_rate']*100:.0f}%\n"
-            f"Kill Switch: {'ACTIVE' if self.risk.kill_switch_active else 'off'}\n"
+            f"Drawdown: {stats['drawdown']*100:.1f}%\n\n"
+            f"Open Positions: {stats['open_positions']}\n"
+            f"Win Rate: {stats['win_rate']*100:.0f}% ({stats['total_trades']} trades)\n"
+            f"Resolution: {stats['resolution_accuracy']*100:.0f}%\n\n"
+            f"Kill Switch: {kill}\n"
+            f"Falcon API: {falcon}\n"
             f"Uptime: {stats['uptime']}"
         )
+        return text, None
 
-    def _cmd_kill(self) -> str:
-        self.risk.activate_kill_switch()
-        return "Kill switch activated. All trading halted."
-
-    def _cmd_trades(self) -> str:
-        closed = self.portfolio._closed[-10:]
-        if not closed:
-            return "No closed trades yet."
-        lines = ["<b>Last 10 Trades</b>"]
-        for c in reversed(closed):
-            lines.append(
-                f"{c.location} {c.bucket_label} | "
-                f"${c.entry_price:.2f} -> ${c.exit_price:.2f} | "
-                f"P&L: ${c.realized_pnl:+.2f} | {c.resolution}"
-            )
-        return "\n".join(lines)
-
-    def _cmd_pnl(self) -> str:
-        stats = self.portfolio.get_stats()
-        return (
-            f"<b>P&L</b>\n"
-            f"Daily: ${stats['daily_pnl']:+.2f}\n"
-            f"Portfolio: ${stats['portfolio_value']:.2f}\n"
-            f"Starting: ${settings.STARTING_CAPITAL:.2f}"
-        )
-
-    def _cmd_weather(self) -> str:
-        lines = ["<b>Current Forecasts</b>"]
-        today = datetime.now(timezone.utc).date()
-        for loc_key in LOCATIONS:
-            fc = self.noaa.get_latest(loc_key, today)
-            if fc:
-                agree = "Y" if fc.model_agreement else "N"
-                lines.append(
-                    f"{loc_key}: High {fc.forecasted_high_f:.0f}°F "
-                    f"(shift: {fc.forecast_shift_f:+.0f}°F, agree: {agree})"
-                )
-            else:
-                lines.append(f"{loc_key}: No forecast data")
-        return "\n".join(lines)
-
-    def _cmd_positions(self) -> str:
+    async def _cmd_positions(self) -> tuple[str, bytes | None]:
         positions = self.portfolio.get_open_positions()
         if not positions:
-            return "No open positions."
-        lines = ["<b>Open Positions</b>"]
-        for p in positions:
-            edge = ((p.current_price - p.entry_price) / max(p.entry_price, 0.001)) * 100
+            return "No open positions.", None
+
+        lines = ["\U0001f4cd <b>OPEN POSITIONS</b>\n"]
+        chart_data = []
+        for i, p in enumerate(positions, 1):
+            edge_pct = ((p.current_price - p.entry_price) / max(p.entry_price, 0.001)) * 100
+            pnl_emoji = "\U0001f7e2" if p.unrealized_pnl >= 0 else "\U0001f534"
             lines.append(
-                f"{p.location} {p.bucket_label} | "
-                f"Entry: ${p.entry_price:.2f} | Current: ${p.current_price:.2f} | "
-                f"Edge: {edge:+.0f}% | uPnL: ${p.unrealized_pnl:+.2f}"
+                f"{i}. {pnl_emoji} <b>{p.location}</b> {p.bucket_label}\n"
+                f"   Entry: ${p.entry_price:.2f} | Now: ${p.current_price:.2f}\n"
+                f"   Edge: {edge_pct:+.0f}% | uPnL: ${p.unrealized_pnl:+.2f}"
             )
-        return "\n".join(lines)
+            chart_data.append({
+                "location": p.location,
+                "bucket": p.bucket_label,
+                "unrealized_pnl": p.unrealized_pnl,
+            })
 
-    # ------------------------------------------------------------------
-    # Dashboard refresh
-    # ------------------------------------------------------------------
+        text = "\n".join(lines)
+        image = generate_positions_chart(chart_data)
+        return text, image
 
-    def _refresh_dashboard(self) -> None:
-        self.dashboard.update_portfolio(self.portfolio.get_stats())
+    async def _cmd_trades(self) -> tuple[str, bytes | None]:
+        trades = await self.db.get_recent_trades(10)
+        if not trades:
+            return "No trades yet.", None
 
-        # Forecasts
+        lines = ["\U0001f4dd <b>RECENT TRADES</b>\n"]
+        for t in trades:
+            side_emoji = "\U0001f7e2" if t["side"] == "BUY" else "\U0001f534"
+            pnl_str = f"${t['pnl']:+.2f}" if t.get("pnl") is not None else "open"
+            lines.append(
+                f"{side_emoji} {t['location']} {t['bucket_label']} | "
+                f"{t['side']} @ ${t['price']:.2f} | "
+                f"${t['size_usd']:.2f} | {pnl_str}"
+            )
+        return "\n".join(lines), None
+
+    async def _cmd_pnl(self) -> tuple[str, bytes | None]:
+        stats = self.portfolio.get_stats()
+        closed = self.portfolio._closed
+        wins = sum(1 for c in closed if c.realized_pnl > 0)
+        losses = len(closed) - wins
+        total_pnl = sum(c.realized_pnl for c in closed)
+
+        text = (
+            "\U0001f4b0 <b>P&L BREAKDOWN</b>\n\n"
+            f"Portfolio: <b>${stats['portfolio_value']:.2f}</b>\n"
+            f"Starting: ${settings.STARTING_CAPITAL:.2f}\n"
+            f"Daily P&L: ${stats['daily_pnl']:+.2f}\n"
+            f"Realized: ${total_pnl:+.2f}\n"
+            f"Wins: {wins} | Losses: {losses}"
+        )
+
+        image = generate_win_rate_chart(wins, losses, total_pnl)
+        return text, image
+
+    async def _cmd_weather(self) -> tuple[str, bytes | None]:
+        lines = ["\U0001f326 <b>NOAA FORECASTS</b>\n"]
         today = datetime.now(timezone.utc).date()
-        forecasts = []
+
         for loc_key in LOCATIONS:
             fc = self.noaa.get_latest(loc_key, today)
             if fc:
-                forecasts.append({
-                    "city": loc_key,
-                    "date": str(fc.target_date),
-                    "high": fc.forecasted_high_f,
-                    "sigma": 0.0,
-                    "shift": fc.forecast_shift_f,
-                    "model_run": fc.model_run_time.strftime("%Hz") if fc.model_run_time else "",
-                    "agreement": fc.model_agreement,
-                })
-        self.dashboard.update_forecasts(forecasts)
+                agree = "\u2705" if fc.model_agreement else "\u274c"
+                shift_str = f"{fc.forecast_shift_f:+.0f}°F" if fc.forecast_shift_f != 0 else "0°F"
+                lines.append(
+                    f"<b>{loc_key}</b>: High {fc.forecasted_high_f:.0f}°F "
+                    f"(shift: {shift_str}) {agree}"
+                )
+                if fc.open_meteo_high_f:
+                    lines.append(f"   Open-Meteo: {fc.open_meteo_high_f:.0f}°F")
+            else:
+                lines.append(f"<b>{loc_key}</b>: No forecast data")
 
-        # Positions
-        positions = []
-        for p in self.portfolio.get_open_positions():
-            positions.append({
-                "location": p.location,
-                "bucket": p.bucket_label,
-                "entry_price": p.entry_price,
-                "current_price": p.current_price,
-                "size": p.qty * p.entry_price,
-                "unrealized_pnl": p.unrealized_pnl,
-            })
-        self.dashboard.update_positions(positions)
+        return "\n".join(lines), None
 
-        # Falcon status
-        if self.falcon.is_enabled:
-            self.dashboard.update_falcon(["Falcon API: connected"])
-        else:
-            self.dashboard.update_falcon(["Falcon API: disabled"])
+    async def _cmd_forecast(self) -> tuple[str, bytes | None]:
+        """Show forecast distribution for the first city with data."""
+        today = datetime.now(timezone.utc).date()
+        for loc_key in LOCATIONS:
+            fc = self.noaa.get_latest(loc_key, today)
+            if not fc:
+                continue
+            probs = self.model.compute_probabilities(
+                location=loc_key,
+                target_date=today,
+                forecast_high_f=fc.forecasted_high_f,
+                lead_days=0,
+                model_agreement=fc.model_agreement,
+            )
+            if not probs:
+                continue
+
+            # Build bucket data for chart
+            bucket_defs = {b.contract_id: b for b in self.polymarket.get_bucket_defs()}
+            chart_buckets = {}
+            for cid, prob in probs.buckets.items():
+                bdef = bucket_defs.get(cid)
+                if bdef:
+                    chart_buckets[bdef.label] = (bdef.temp_low_f, bdef.temp_high_f, prob)
+
+            if chart_buckets:
+                image = generate_forecast_chart(
+                    loc_key, str(today), fc.forecasted_high_f, probs.sigma_f, chart_buckets
+                )
+                return f"\U0001f4ca Forecast distribution for <b>{loc_key}</b>", image
+
+        return "No forecast data with active buckets available.", None
+
+    async def _cb_forecast(self, data: str) -> tuple[str, bytes | None]:
+        """Handle forecast:LOCATION callback."""
+        parts = data.split(":")
+        if len(parts) < 2:
+            return "Invalid callback", None
+        loc_key = parts[1]
+        today = datetime.now(timezone.utc).date()
+        fc = self.noaa.get_latest(loc_key, today)
+        if not fc:
+            return f"No forecast data for {loc_key}", None
+
+        probs = self.model.compute_probabilities(
+            location=loc_key,
+            target_date=today,
+            forecast_high_f=fc.forecasted_high_f,
+            lead_days=0,
+            model_agreement=fc.model_agreement,
+        )
+        if not probs:
+            return f"No bucket probabilities for {loc_key}", None
+
+        bucket_defs = {b.contract_id: b for b in self.polymarket.get_bucket_defs()}
+        chart_buckets = {}
+        for cid, prob in probs.buckets.items():
+            bdef = bucket_defs.get(cid)
+            if bdef:
+                chart_buckets[bdef.label] = (bdef.temp_low_f, bdef.temp_high_f, prob)
+
+        if chart_buckets:
+            image = generate_forecast_chart(
+                loc_key, str(today), fc.forecasted_high_f, probs.sigma_f, chart_buckets
+            )
+            return f"Forecast: <b>{loc_key}</b> — High {fc.forecasted_high_f:.0f}°F", image
+
+        return f"No active buckets for {loc_key}", None
+
+    async def _cmd_signals(self) -> tuple[str, bytes | None]:
+        log = self.telegram.get_signal_log(15)
+        if not log:
+            return "No signals logged yet.", None
+        lines = ["\U0001f50d <b>RECENT SIGNALS</b>\n"]
+        for entry in log:
+            lines.append(f"<code>{entry}</code>")
+        return "\n".join(lines), None
+
+    async def _cmd_settings(self) -> tuple[str, bytes | None]:
+        text = (
+            "\u2699\ufe0f <b>SETTINGS</b>\n\n"
+            f"Entry Threshold: ${settings.ENTRY_THRESHOLD}\n"
+            f"Exit Threshold: ${settings.EXIT_THRESHOLD}\n"
+            f"Min Value Ratio: {settings.MIN_VALUE_RATIO}x\n"
+            f"Min Edge: {settings.MIN_EDGE*100:.0f}%\n"
+            f"Min Confidence: {settings.MIN_CONFIDENCE}\n"
+            f"Kelly Fraction: {settings.KELLY_FRACTION}\n"
+            f"Max Trade Size: ${settings.MAX_TRADE_SIZE}\n"
+            f"Max Positions: {settings.MAX_OPEN_POSITIONS}\n"
+            f"Max Drawdown: {settings.MAX_DAILY_DRAWDOWN*100:.0f}%\n"
+            f"Scan Interval: {settings.SCAN_INTERVAL}s\n"
+            f"Falcon Enabled: {self.falcon.is_enabled}\n"
+            f"Live Trading: {self.executor.is_live}"
+        )
+        return text, None
+
+    async def _cmd_kill(self) -> tuple[str, bytes | None]:
+        self.risk.activate_kill_switch()
+        return "\U0001f6a8 Kill switch activated. All trading halted.\nUse /resume to re-enable.", None
+
+    async def _cmd_resume(self) -> tuple[str, bytes | None]:
+        if self.risk.kill_switch_active:
+            self.risk._kill_switch_active = False
+            self.risk._drawdown_alerts_sent.clear()
+            return "\U0001f7e2 Kill switch deactivated. Trading resumed.", None
+        return "Kill switch was not active.", None
+
+    async def _cmd_help(self) -> tuple[str, bytes | None]:
+        text = (
+            "\U0001f4d6 <b>COMMANDS</b>\n\n"
+            "/start — Main menu\n"
+            "/status — Portfolio status + stats\n"
+            "/positions — Open positions + chart\n"
+            "/trades — Recent trade history\n"
+            "/pnl — P&L breakdown + win rate chart\n"
+            "/weather — Current NOAA forecasts\n"
+            "/forecast — Probability distribution chart\n"
+            "/signals — Recent signal log\n"
+            "/settings — Bot configuration\n"
+            "/kill — Activate kill switch\n"
+            "/resume — Deactivate kill switch\n"
+            "/help — This message"
+        )
+        return text, None
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Polymarket Weather Arbitrage Bot")
-    parser.add_argument("--live", action="store_true", help="Enable live trading (requires env + config flags too)")
-    parser.add_argument("--no-dashboard", action="store_true", help="Run without terminal dashboard")
+    parser.add_argument("--live", action="store_true", help="Enable live trading")
     return parser.parse_args()
 
 
@@ -485,7 +599,7 @@ def main() -> None:
     setup_logging()
     args = parse_args()
 
-    bot = Bot(live_flag=args.live, no_dashboard=args.no_dashboard)
+    bot = Bot(live_flag=args.live)
 
     loop = asyncio.new_event_loop()
 
@@ -493,7 +607,6 @@ def main() -> None:
         logger.info("Received signal %d, shutting down...", sig)
         loop.call_soon_threadsafe(lambda: asyncio.ensure_future(bot.shutdown()))
 
-    import types
     signal.signal(signal.SIGINT, handle_signal)
     signal.signal(signal.SIGTERM, handle_signal)
 
@@ -506,5 +619,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    from typing import Any
     main()
