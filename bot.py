@@ -1,0 +1,970 @@
+#!/usr/bin/env python3
+"""Polymarket Trading Bot — Telegram-controlled.
+
+Full-featured Telegram bot for Polymarket prediction market trading.
+Supports paper mode (shadow trading with realistic fills) and live mode.
+
+Usage:
+    # Set env vars first:
+    #   TELEGRAM_BOT_TOKEN=your_token
+    #   TELEGRAM_CHAT_ID=your_chat_id
+    #   (Optional for live: POLYMARKET_PRIVATE_KEY, POLYMARKET_API_KEY, etc.)
+
+    python bot.py --mode paper --capital 50
+    python bot.py --mode live
+
+Telegram Commands:
+    /start          — Welcome + mode info
+    /status         — Portfolio overview
+    /positions      — Open positions with mark-to-market
+    /trades         — Recent trade history
+    /pnl            — P&L breakdown
+    /scan           — Trigger manual scan
+    /opportunities  — Current signals ranked by edge
+    /markets        — Tracked market universe
+    /mode           — Toggle paper/live mode
+    /capital <amt>  — Set starting capital (paper mode)
+    /kill           — Emergency stop all trading
+    /resume         — Resume trading after kill
+    /stats          — Fundamental Law stats (IC, effective-N, IR)
+    /config         — Show/edit strategy parameters
+    /help           — Command reference
+"""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import json
+import logging
+import os
+import sqlite3
+import sys
+import time
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
+
+import numpy as np
+
+try:
+    import aiohttp
+except ImportError:
+    sys.exit("pip install aiohttp")
+
+try:
+    from telegram import (
+        Update, BotCommand, InlineKeyboardButton, InlineKeyboardMarkup,
+    )
+    from telegram.ext import (
+        Application, CommandHandler, CallbackQueryHandler, ContextTypes,
+    )
+except ImportError:
+    sys.exit("pip install python-telegram-bot")
+
+from core.markov_model import MarkovModel
+from core.bias_calibrator import BiasCalibrator
+from core.alpha_combiner import AlphaCombiner
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%H:%M:%S",
+)
+logger = logging.getLogger(__name__)
+
+GAMMA_API = "https://gamma-api.polymarket.com"
+CLOB_API = "https://clob.polymarket.com"
+
+
+# ─── Data Models ───────────────────────────────────────────────────
+
+@dataclass
+class Market:
+    condition_id: str
+    question: str
+    slug: str
+    category: str
+    outcomes: list[str]
+    token_ids: list[str]
+    liquidity: float
+    volume_24h: float
+    end_date: str
+    yes_price: float = 0.0
+    no_price: float = 0.0
+    mid_price: float = 0.0
+    spread: float = 0.0
+    best_bid: float = 0.0
+    best_ask: float = 1.0
+    price_history: list[float] = field(default_factory=list)
+
+
+@dataclass
+class PaperPosition:
+    token_id: str
+    market_id: str
+    question: str
+    category: str
+    direction: str  # BUY (yes) or SELL (no)
+    entry_price: float
+    size_usd: float
+    edge_at_entry: float
+    limit_price: float  # The price our limit order was placed at
+    filled: bool = False
+    fill_time: str = ""
+    opened_at: str = ""
+
+
+@dataclass
+class TradeRecord:
+    timestamp: str
+    market_id: str
+    question: str
+    category: str
+    direction: str
+    entry_price: float
+    exit_price: float
+    size_usd: float
+    edge: float
+    pnl: float
+    mode: str  # PAPER or LIVE
+
+
+# ─── Bot State ─────────────────────────────────────────────────────
+
+class BotState:
+    """Central state for the trading bot."""
+
+    def __init__(self, mode: str = "paper", capital: float = 50.0):
+        self.mode = mode  # "paper" or "live"
+        self.starting_capital = capital
+        self.cash = capital
+        self.positions: dict[str, PaperPosition] = {}
+        self.trades: list[TradeRecord] = []
+        self.markets: dict[str, Market] = {}
+        self.signals: list[dict] = []  # Recent signals
+        self.kill_switch = False
+        self.scan_count = 0
+        self.start_time = datetime.now(timezone.utc)
+
+        # Models
+        self.markov = MarkovModel(n_states=10, n_simulations=5000)
+        self.calibrator = BiasCalibrator()
+        self.combiner = AlphaCombiner(min_trades_for_ic=10)
+        for name in ["markov_mc", "markov_absorb", "no_bias", "maker_edge"]:
+            self.combiner.register_strategy(name)
+
+        # DB
+        self.db = self._init_db()
+
+    @property
+    def total_value(self) -> float:
+        pos_value = sum(p.size_usd for p in self.positions.values())
+        return self.cash + pos_value
+
+    @property
+    def total_pnl(self) -> float:
+        return sum(t.pnl for t in self.trades)
+
+    @property
+    def win_rate(self) -> float:
+        if not self.trades:
+            return 0.0
+        return len([t for t in self.trades if t.pnl > 0]) / len(self.trades)
+
+    @property
+    def n_trades(self) -> int:
+        return len(self.trades)
+
+    @property
+    def uptime(self) -> str:
+        delta = datetime.now(timezone.utc) - self.start_time
+        hours = int(delta.total_seconds() // 3600)
+        minutes = int((delta.total_seconds() % 3600) // 60)
+        return f"{hours}h {minutes}m"
+
+    def _init_db(self):
+        os.makedirs("data", exist_ok=True)
+        conn = sqlite3.connect("data/bot_trades.db")
+        conn.execute("""CREATE TABLE IF NOT EXISTS trades (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT, market_id TEXT, question TEXT, category TEXT,
+            direction TEXT, entry_price REAL, exit_price REAL,
+            size_usd REAL, edge REAL, pnl REAL, mode TEXT
+        )""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS snapshots (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT, cash REAL, positions_count INTEGER,
+            total_value REAL, total_pnl REAL, win_rate REAL
+        )""")
+        conn.commit()
+        return conn
+
+    def log_trade(self, trade: TradeRecord):
+        self.trades.append(trade)
+        self.db.execute(
+            "INSERT INTO trades (timestamp, market_id, question, category, direction, "
+            "entry_price, exit_price, size_usd, edge, pnl, mode) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            (trade.timestamp, trade.market_id, trade.question, trade.category,
+             trade.direction, trade.entry_price, trade.exit_price,
+             trade.size_usd, trade.edge, trade.pnl, trade.mode),
+        )
+        self.db.commit()
+
+    def snapshot(self):
+        self.db.execute(
+            "INSERT INTO snapshots (timestamp, cash, positions_count, total_value, total_pnl, win_rate) "
+            "VALUES (?,?,?,?,?,?)",
+            (datetime.now(timezone.utc).isoformat(), self.cash,
+             len(self.positions), self.total_value, self.total_pnl, self.win_rate),
+        )
+        self.db.commit()
+
+
+# ─── Market Data ───────────────────────────────────────────────────
+
+def classify(text: str, tags: list[str]) -> str:
+    combined = f"{text} {' '.join(tags)}".lower()
+    for cat, kws in {
+        "sports": ["nba", "nfl", "mlb", "nhl", "ufc", "tennis", "game", "match", "set 1", "kills"],
+        "crypto": ["bitcoin", "btc", "ethereum", "eth", "solana", "sol", "crypto", "xrp", "dogecoin", "up or down"],
+        "politics": ["president", "election", "trump", "biden", "congress", "vote", "pm ", "minister"],
+        "macro": ["fed", "interest rate", "inflation", "gdp", "tariff"],
+    }.items():
+        if any(kw in combined for kw in kws):
+            return cat
+    return "other"
+
+
+def is_coinflip(q: str) -> bool:
+    q = q.lower()
+    return ("up or down" in q and any(x in q for x in ["am", "pm", "et"])) or \
+           ("penta kill" in q) or ("odd/even" in q)
+
+
+async def fetch_markets(session: aiohttp.ClientSession) -> list[dict]:
+    try:
+        async with session.get(
+            f"{GAMMA_API}/markets",
+            params={"active": "true", "closed": "false", "limit": 100,
+                    "order": "volume24hr", "ascending": "false"},
+            timeout=aiohttp.ClientTimeout(total=15)
+        ) as resp:
+            if resp.status == 200:
+                return await resp.json()
+    except Exception as e:
+        logger.warning(f"Gamma API: {e}")
+    return []
+
+
+async def fetch_book(session: aiohttp.ClientSession, token_id: str) -> dict:
+    try:
+        async with session.get(
+            f"{CLOB_API}/book", params={"token_id": token_id},
+            timeout=aiohttp.ClientTimeout(total=8)
+        ) as resp:
+            if resp.status == 200:
+                return await resp.json()
+    except Exception:
+        pass
+    return {}
+
+
+async def fetch_history(session: aiohttp.ClientSession, token_id: str) -> list[float]:
+    try:
+        async with session.get(
+            f"{CLOB_API}/prices-history",
+            params={"market": token_id, "interval": "max", "fidelity": "60"},
+            timeout=aiohttp.ClientTimeout(total=10)
+        ) as resp:
+            if resp.status == 200:
+                data = await resp.json()
+                return [h["p"] for h in data.get("history", [])]
+    except Exception:
+        pass
+    return []
+
+
+# ─── Trading Logic ─────────────────────────────────────────────────
+
+def kelly_size(edge: float, price: float, bankroll: float) -> float:
+    if price <= 0.01 or price >= 0.99 or edge <= 0:
+        return 0.0
+    odds = (1.0 / price) - 1.0
+    if odds <= 0:
+        return 0.0
+    p = min(price + edge, 0.99)
+    kelly = ((p * odds - (1 - p)) / odds) * 0.25
+    if kelly <= 0:
+        return 0.0
+    return max(0.50, min(kelly * bankroll, 5.0))
+
+
+def evaluate_market(market: Market, state: BotState) -> dict | None:
+    """Evaluate a market and return signal dict or None."""
+    if is_coinflip(market.question):
+        return None
+    if len(market.price_history) < 15:
+        return None
+    if market.mid_price < 0.08 or market.mid_price > 0.92:
+        return None
+    # Skip if already positioned
+    for tid in market.token_ids:
+        if tid in state.positions:
+            return None
+
+    price = market.mid_price
+    est = state.markov.estimate(
+        market.condition_id, market.price_history, price,
+        horizon_steps=20, calibrator=state.calibrator,
+    )
+    if est.confidence < 0.3:
+        return None
+
+    cal_edge = est.calibrated_probability - price
+    cat_mult = state.calibrator.get_category_multiplier(market.category)
+    no_edge = state.calibrator.get_no_side_edge(price)
+    MAKER = 0.0112
+
+    if cal_edge < 0:
+        total_edge = abs(cal_edge) * cat_mult + no_edge * 0.4 + MAKER
+        direction = "SELL"
+        kelly_price = 1.0 - price
+    elif cal_edge > 0:
+        total_edge = cal_edge * cat_mult * 0.7 + MAKER
+        direction = "BUY"
+        kelly_price = price
+    else:
+        return None
+
+    if total_edge < 0.035:
+        return None
+
+    # Volatility filter
+    if len(market.price_history) >= 20:
+        vol = np.std(market.price_history[-20:])
+        if vol > 0.25:
+            return None
+
+    size = kelly_size(total_edge, kelly_price, state.cash)
+    if size < 0.50 or state.cash < size:
+        return None
+
+    # Compute limit price (inside the spread for maker edge)
+    if direction == "BUY":
+        limit_price = market.best_bid + market.spread * 0.3  # 30% inside spread
+    else:
+        limit_price = market.best_ask - market.spread * 0.3
+
+    return {
+        "market": market,
+        "direction": direction,
+        "edge": round(total_edge, 4),
+        "size": round(size, 2),
+        "limit_price": round(limit_price, 4),
+        "markov_prob": est.calibrated_probability,
+        "confidence": est.confidence,
+        "category_mult": cat_mult,
+    }
+
+
+def check_shadow_fill(position: PaperPosition, market: Market) -> bool:
+    """Check if a shadow order would have been filled.
+
+    A maker limit order fills when someone crosses our price level.
+    For BUY: fills when ask drops to or below our limit
+    For SELL: fills when bid rises to or above our limit
+    """
+    if position.filled:
+        return True
+    if position.direction == "BUY":
+        return market.best_ask <= position.limit_price
+    else:
+        return market.best_bid >= position.limit_price
+
+
+# ─── Telegram Handlers ────────────────────────────────────────────
+
+def build_app(state: BotState, http_session_holder: list) -> Application:
+    """Build the Telegram application with all handlers."""
+    token = os.getenv("TELEGRAM_BOT_TOKEN", "")
+    if not token:
+        logger.error("TELEGRAM_BOT_TOKEN not set")
+        sys.exit(1)
+
+    app = Application.builder().token(token).build()
+    chat_id = os.getenv("TELEGRAM_CHAT_ID", "")
+
+    def authorized(update: Update) -> bool:
+        if not chat_id:
+            return True
+        return str(update.effective_chat.id) == chat_id
+
+    # ── /start ──
+    async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        if not authorized(update):
+            return
+        text = (
+            "<b>Polymarket Trading Bot</b>\n\n"
+            f"Mode: <b>{state.mode.upper()}</b>\n"
+            f"Capital: <b>${state.starting_capital:.2f}</b>\n"
+            f"Model: Markov Chain + Bias Calibration\n"
+            f"Kelly: Quarter (0.25)\n\n"
+            "Use /help for all commands"
+        )
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("Status", callback_data="cmd:status"),
+             InlineKeyboardButton("Scan Now", callback_data="cmd:scan")],
+            [InlineKeyboardButton("Positions", callback_data="cmd:positions"),
+             InlineKeyboardButton("P&L", callback_data="cmd:pnl")],
+        ])
+        await update.message.reply_text(text, parse_mode="HTML", reply_markup=kb)
+
+    # ── /status ──
+    async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        if not authorized(update):
+            return
+        dd = 0.0
+        if state.trades:
+            eq = [state.starting_capital]
+            for t in state.trades:
+                eq.append(eq[-1] + t.pnl)
+            peak = max(eq)
+            dd = (peak - eq[-1]) / peak * 100 if peak > 0 else 0
+
+        text = (
+            "<b>Portfolio Status</b>\n\n"
+            f"Mode:       <b>{state.mode.upper()}</b>\n"
+            f"Cash:       ${state.cash:.2f}\n"
+            f"Positions:  {len(state.positions)}\n"
+            f"Total Value: <b>${state.total_value:.2f}</b>\n"
+            f"Total P&L:  <b>${state.total_pnl:+.2f}</b>\n"
+            f"Return:     {(state.total_value / state.starting_capital - 1) * 100:+.1f}%\n"
+            f"Trades:     {state.n_trades}\n"
+            f"Win Rate:   {state.win_rate * 100:.1f}%\n"
+            f"Drawdown:   {dd:.1f}%\n"
+            f"Markets:    {len(state.markets)}\n"
+            f"Scans:      {state.scan_count}\n"
+            f"Uptime:     {state.uptime}\n"
+            f"Kill Switch: {'ON' if state.kill_switch else 'OFF'}"
+        )
+        await update.message.reply_text(text, parse_mode="HTML")
+
+    # ── /positions ──
+    async def cmd_positions(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        if not authorized(update):
+            return
+        if not state.positions:
+            await update.message.reply_text("No open positions.")
+            return
+        lines = ["<b>Open Positions</b>\n"]
+        for tid, pos in state.positions.items():
+            fill_status = "FILLED" if pos.filled else "PENDING"
+            m = state.markets.get(pos.market_id)
+            current = m.mid_price if m else pos.entry_price
+            lines.append(
+                f"{'BUY' if pos.direction == 'BUY' else 'SELL NO'} "
+                f"<b>{pos.question[:40]}</b>\n"
+                f"  Entry: {pos.entry_price:.3f} | Now: {current:.3f} | "
+                f"${pos.size_usd:.2f} | {fill_status}\n"
+            )
+        await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+
+    # ── /trades ──
+    async def cmd_trades(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        if not authorized(update):
+            return
+        if not state.trades:
+            await update.message.reply_text("No trades yet.")
+            return
+        recent = state.trades[-10:]
+        lines = ["<b>Recent Trades</b>\n"]
+        for t in reversed(recent):
+            emoji = "+" if t.pnl > 0 else "-" if t.pnl < 0 else "~"
+            lines.append(
+                f"[{emoji}] {t.direction} {t.question[:35]}\n"
+                f"  ${t.entry_price:.3f} -> ${t.exit_price:.3f} | "
+                f"PnL: <b>${t.pnl:+.2f}</b> | {t.mode}"
+            )
+        await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+
+    # ── /pnl ──
+    async def cmd_pnl(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        if not authorized(update):
+            return
+        if not state.trades:
+            await update.message.reply_text("No trades to analyze.")
+            return
+
+        wins = [t for t in state.trades if t.pnl > 0]
+        losses = [t for t in state.trades if t.pnl <= 0]
+        buys = [t for t in state.trades if t.direction == "BUY"]
+        sells = [t for t in state.trades if t.direction == "SELL"]
+
+        buy_wr = len([t for t in buys if t.pnl > 0]) / max(len(buys), 1) * 100
+        sell_wr = len([t for t in sells if t.pnl > 0]) / max(len(sells), 1) * 100
+
+        text = (
+            "<b>P&L Breakdown</b>\n\n"
+            f"Total P&L:     <b>${state.total_pnl:+.2f}</b>\n"
+            f"Return:        {(state.total_value / state.starting_capital - 1) * 100:+.1f}%\n"
+            f"Trades:        {len(state.trades)}\n"
+            f"Wins/Losses:   {len(wins)}/{len(losses)}\n"
+            f"Win Rate:      {state.win_rate * 100:.1f}%\n\n"
+            f"<b>By Direction:</b>\n"
+            f"  BUY:  {len(buys)} trades, {buy_wr:.0f}% WR\n"
+            f"  SELL: {len(sells)} trades, {sell_wr:.0f}% WR\n\n"
+            f"<b>By Category:</b>"
+        )
+        cats = {}
+        for t in state.trades:
+            if t.category not in cats:
+                cats[t.category] = {"n": 0, "pnl": 0.0, "w": 0}
+            cats[t.category]["n"] += 1
+            cats[t.category]["pnl"] += t.pnl
+            if t.pnl > 0:
+                cats[t.category]["w"] += 1
+
+        for cat, s in sorted(cats.items(), key=lambda x: -x[1]["pnl"]):
+            wr = s["w"] / s["n"] * 100
+            text += f"\n  {cat}: {s['n']} trades, {wr:.0f}% WR, ${s['pnl']:+.2f}"
+
+        await update.message.reply_text(text, parse_mode="HTML")
+
+    # ── /scan ──
+    async def cmd_scan(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        if not authorized(update):
+            return
+        await update.message.reply_text("Scanning markets...")
+        session = http_session_holder[0]
+        if session:
+            signals = await run_scan(session, state)
+            if signals:
+                lines = [f"<b>Found {len(signals)} opportunities:</b>\n"]
+                for sig in signals[:5]:
+                    m = sig["market"]
+                    lines.append(
+                        f"{sig['direction']} <b>{m.question[:40]}</b>\n"
+                        f"  Edge: {sig['edge']*100:.1f}% | Size: ${sig['size']:.2f} | "
+                        f"Conf: {sig['confidence']:.0%}"
+                    )
+                await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+            else:
+                await update.message.reply_text("No opportunities found this scan.")
+
+    # ── /opportunities ──
+    async def cmd_opportunities(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        if not authorized(update):
+            return
+        if not state.signals:
+            await update.message.reply_text("No recent signals. Use /scan first.")
+            return
+        lines = ["<b>Recent Signals (ranked by edge)</b>\n"]
+        for sig in sorted(state.signals, key=lambda s: -s["edge"])[:10]:
+            m = sig["market"]
+            lines.append(
+                f"{sig['direction']} <b>{m.question[:40]}</b>\n"
+                f"  Edge: {sig['edge']*100:.1f}% | ${sig['size']:.2f} | "
+                f"{m.category} | {sig['confidence']:.0%}\n"
+            )
+        await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+
+    # ── /markets ──
+    async def cmd_markets(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        if not authorized(update):
+            return
+        cats = {}
+        for m in state.markets.values():
+            cats[m.category] = cats.get(m.category, 0) + 1
+        text = f"<b>Market Universe: {len(state.markets)} markets</b>\n\n"
+        for cat, n in sorted(cats.items(), key=lambda x: -x[1]):
+            text += f"  {cat}: {n}\n"
+        top = sorted(state.markets.values(), key=lambda m: -m.volume_24h)[:5]
+        text += "\n<b>Top by volume:</b>\n"
+        for m in top:
+            text += f"  ${m.volume_24h/1000:.0f}K — {m.question[:45]}\n"
+        await update.message.reply_text(text, parse_mode="HTML")
+
+    # ── /mode ──
+    async def cmd_mode(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        if not authorized(update):
+            return
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("PAPER", callback_data="mode:paper"),
+             InlineKeyboardButton("LIVE", callback_data="mode:live")],
+        ])
+        await update.message.reply_text(
+            f"Current mode: <b>{state.mode.upper()}</b>\nSelect new mode:",
+            parse_mode="HTML", reply_markup=kb
+        )
+
+    # ── /capital ──
+    async def cmd_capital(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        if not authorized(update):
+            return
+        if state.mode != "paper":
+            await update.message.reply_text("Capital can only be set in paper mode.")
+            return
+        args = ctx.args
+        if args and args[0].replace(".", "").isdigit():
+            new_cap = float(args[0])
+            state.starting_capital = new_cap
+            state.cash = new_cap
+            state.positions.clear()
+            state.trades.clear()
+            await update.message.reply_text(
+                f"Capital reset to <b>${new_cap:.2f}</b>. Portfolio cleared.",
+                parse_mode="HTML"
+            )
+        else:
+            await update.message.reply_text(
+                f"Current capital: ${state.starting_capital:.2f}\n"
+                "Usage: /capital 100"
+            )
+
+    # ── /kill ──
+    async def cmd_kill(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        if not authorized(update):
+            return
+        state.kill_switch = True
+        await update.message.reply_text(
+            "<b>KILL SWITCH ACTIVATED</b>\nAll trading halted. Use /resume to restart.",
+            parse_mode="HTML"
+        )
+
+    # ── /resume ──
+    async def cmd_resume(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        if not authorized(update):
+            return
+        state.kill_switch = False
+        await update.message.reply_text("Trading resumed.")
+
+    # ── /stats ──
+    async def cmd_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        if not authorized(update):
+            return
+        fl = state.combiner.get_fundamental_law_stats()
+        text = (
+            "<b>Alpha Combination — Fundamental Law</b>\n\n"
+            f"IR = IC x sqrt(N)\n\n"
+            f"Avg IC:          {fl['avg_ic']:.4f}\n"
+            f"Effective N:     {fl['effective_n']:.2f}\n"
+            f"Information Ratio: <b>{fl['information_ratio']:.4f}</b>\n"
+            f"Strategies:      {fl['n_strategies_tracked']}\n"
+            f"With IC data:    {fl['n_strategies_with_ic']}\n"
+        )
+        if fl["per_strategy_ic"]:
+            text += "\n<b>Per-Strategy IC:</b>\n"
+            for name, ic in fl["per_strategy_ic"].items():
+                text += f"  {name}: {ic:+.4f}\n"
+        if fl["optimal_weights"]:
+            text += "\n<b>Optimal Weights:</b>\n"
+            for name, w in fl["optimal_weights"].items():
+                text += f"  {name}: {w:.4f}\n"
+        await update.message.reply_text(text, parse_mode="HTML")
+
+    # ── /help ──
+    async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        if not authorized(update):
+            return
+        text = (
+            "<b>Command Reference</b>\n\n"
+            "/start — Welcome\n"
+            "/status — Portfolio overview\n"
+            "/positions — Open positions\n"
+            "/trades — Recent trades\n"
+            "/pnl — P&L breakdown\n"
+            "/scan — Manual market scan\n"
+            "/opportunities — Current signals\n"
+            "/markets — Market universe\n"
+            "/mode — Toggle paper/live\n"
+            "/capital &lt;amt&gt; — Set paper capital\n"
+            "/kill — Emergency stop\n"
+            "/resume — Resume trading\n"
+            "/stats — Alpha combiner stats\n"
+            "/help — This message"
+        )
+        await update.message.reply_text(text, parse_mode="HTML")
+
+    # ── Callbacks ──
+    async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        query = update.callback_query
+        await query.answer()
+        data = query.data or ""
+
+        if data.startswith("mode:"):
+            new_mode = data.split(":")[1]
+            if new_mode == "live" and not os.getenv("POLYMARKET_PRIVATE_KEY"):
+                await query.edit_message_text(
+                    "Cannot switch to LIVE: POLYMARKET_PRIVATE_KEY not set.",
+                    parse_mode="HTML"
+                )
+                return
+            state.mode = new_mode
+            await query.edit_message_text(
+                f"Mode switched to <b>{new_mode.upper()}</b>",
+                parse_mode="HTML"
+            )
+
+    # Register all handlers
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("status", cmd_status))
+    app.add_handler(CommandHandler("positions", cmd_positions))
+    app.add_handler(CommandHandler("trades", cmd_trades))
+    app.add_handler(CommandHandler("pnl", cmd_pnl))
+    app.add_handler(CommandHandler("scan", cmd_scan))
+    app.add_handler(CommandHandler("opportunities", cmd_opportunities))
+    app.add_handler(CommandHandler("markets", cmd_markets))
+    app.add_handler(CommandHandler("mode", cmd_mode))
+    app.add_handler(CommandHandler("capital", cmd_capital))
+    app.add_handler(CommandHandler("kill", cmd_kill))
+    app.add_handler(CommandHandler("resume", cmd_resume))
+    app.add_handler(CommandHandler("stats", cmd_stats))
+    app.add_handler(CommandHandler("help", cmd_help))
+    app.add_handler(CallbackQueryHandler(handle_callback))
+
+    return app
+
+
+# ─── Scan & Trade Loop ────────────────────────────────────────────
+
+async def run_scan(session: aiohttp.ClientSession, state: BotState) -> list[dict]:
+    """Run a full market scan cycle."""
+    state.scan_count += 1
+    signals = []
+
+    # 1. Fetch market universe
+    raw_markets = await fetch_markets(session)
+    for raw in raw_markets:
+        cid = raw.get("conditionId", "")
+        if not cid:
+            continue
+
+        tokens_raw = raw.get("clobTokenIds", "[]")
+        if isinstance(tokens_raw, str):
+            try:
+                token_ids = json.loads(tokens_raw)
+            except:
+                continue
+        elif isinstance(tokens_raw, list):
+            token_ids = tokens_raw
+        else:
+            continue
+        if not token_ids:
+            continue
+
+        outcomes = raw.get("outcomes", [])
+        if isinstance(outcomes, str):
+            try:
+                outcomes = json.loads(outcomes)
+            except:
+                outcomes = ["Yes", "No"]
+
+        prices = raw.get("outcomePrices", "[]")
+        if isinstance(prices, str):
+            try:
+                prices = [float(p) for p in json.loads(prices)]
+            except:
+                prices = []
+        elif isinstance(prices, list):
+            prices = [float(p) for p in prices]
+
+        tags = raw.get("tags", [])
+        if isinstance(tags, str):
+            try:
+                tags = json.loads(tags)
+            except:
+                tags = []
+
+        question = raw.get("question", "")[:100]
+        category = classify(f"{question} {raw.get('description', '')}", [str(t) for t in (tags or [])])
+
+        market = Market(
+            condition_id=cid, question=question, slug=raw.get("slug", ""),
+            category=category, outcomes=outcomes,
+            token_ids=[str(t) for t in token_ids],
+            liquidity=float(raw.get("liquidity", 0) or 0),
+            volume_24h=float(raw.get("volume24hr", 0) or 0),
+            end_date=raw.get("endDate", ""),
+            yes_price=prices[0] if prices else 0,
+            no_price=prices[1] if len(prices) > 1 else 0,
+            mid_price=prices[0] if prices else 0,
+        )
+
+        # Preserve history from previous scans
+        if cid in state.markets and state.markets[cid].price_history:
+            market.price_history = state.markets[cid].price_history
+        state.markets[cid] = market
+
+    # 2. Fetch price history for markets missing it
+    for m in list(state.markets.values()):
+        if len(m.price_history) < 15 and m.token_ids:
+            history = await fetch_history(session, m.token_ids[0])
+            if history:
+                m.price_history = history
+            await asyncio.sleep(0.1)
+
+    # 3. Fetch live orderbooks for top markets
+    top = sorted(state.markets.values(), key=lambda m: -m.volume_24h)[:30]
+    for m in top:
+        if not m.token_ids:
+            continue
+        book = await fetch_book(session, m.token_ids[0])
+        if book:
+            bids = book.get("bids", [])
+            asks = book.get("asks", [])
+            m.best_bid = float(bids[0]["price"]) if bids else 0
+            m.best_ask = float(asks[0]["price"]) if asks else 1
+            m.mid_price = (m.best_bid + m.best_ask) / 2 if (m.best_bid + m.best_ask) > 0 else m.yes_price
+            m.spread = m.best_ask - m.best_bid
+            if m.mid_price > 0:
+                m.price_history.append(m.mid_price)
+        await asyncio.sleep(0.1)
+
+    # 4. Check shadow fills on existing positions
+    for tid, pos in list(state.positions.items()):
+        m = state.markets.get(pos.market_id)
+        if m and not pos.filled and check_shadow_fill(pos, m):
+            pos.filled = True
+            pos.fill_time = datetime.now(timezone.utc).isoformat()
+            logger.info(f"Shadow fill: {pos.direction} {pos.question[:40]}")
+
+        # Check for resolution (price at 0 or 1)
+        if m and (m.mid_price >= 0.98 or m.mid_price <= 0.02):
+            resolution = 1.0 if m.mid_price >= 0.98 else 0.0
+            if pos.direction == "BUY":
+                shares = pos.size_usd / pos.entry_price if pos.entry_price > 0 else 0
+                pnl = shares * resolution - pos.size_usd
+            else:
+                no_price = 1.0 - pos.entry_price
+                shares = pos.size_usd / no_price if no_price > 0 else 0
+                pnl = shares * (1.0 - resolution) - pos.size_usd
+
+            state.cash += pos.size_usd + pnl
+            trade = TradeRecord(
+                timestamp=datetime.now(timezone.utc).isoformat(),
+                market_id=pos.market_id, question=pos.question,
+                category=pos.category, direction=pos.direction,
+                entry_price=pos.entry_price, exit_price=resolution,
+                size_usd=pos.size_usd, edge=pos.edge_at_entry,
+                pnl=round(pnl, 2), mode=state.mode.upper(),
+            )
+            state.log_trade(trade)
+            del state.positions[tid]
+
+    # 5. Generate new signals
+    if not state.kill_switch:
+        for m in top:
+            sig = evaluate_market(m, state)
+            if sig:
+                signals.append(sig)
+
+        # Execute top signals (max 3 per scan)
+        for sig in sorted(signals, key=lambda s: -s["edge"])[:3]:
+            m = sig["market"]
+            token_id = m.token_ids[0] if m.token_ids else m.condition_id
+
+            pos = PaperPosition(
+                token_id=token_id,
+                market_id=m.condition_id,
+                question=m.question,
+                category=m.category,
+                direction=sig["direction"],
+                entry_price=m.mid_price,
+                size_usd=sig["size"],
+                edge_at_entry=sig["edge"],
+                limit_price=sig["limit_price"],
+                filled=False,
+                opened_at=datetime.now(timezone.utc).isoformat(),
+            )
+
+            state.positions[token_id] = pos
+            state.cash -= sig["size"]
+
+    state.signals = signals
+    state.snapshot()
+    return signals
+
+
+# ─── Main ──────────────────────────────────────────────────────────
+
+async def main():
+    parser = argparse.ArgumentParser(description="Polymarket Telegram Trading Bot")
+    parser.add_argument("--mode", choices=["paper", "live"], default="paper")
+    parser.add_argument("--capital", type=float, default=50.0)
+    parser.add_argument("--interval", type=int, default=120, help="Scan interval seconds")
+    args = parser.parse_args()
+
+    state = BotState(mode=args.mode, capital=args.capital)
+    http_session_holder = [None]
+
+    logger.info("Starting Polymarket Bot...")
+    logger.info(f"  Mode: {args.mode.upper()}")
+    logger.info(f"  Capital: ${args.capital:.2f}")
+    logger.info(f"  Interval: {args.interval}s")
+
+    app = build_app(state, http_session_holder)
+
+    # Initialize telegram
+    await app.initialize()
+    await app.start()
+    await app.updater.start_polling(drop_pending_updates=True)
+    logger.info("Telegram bot started. Send /start to your bot.")
+
+    # Send startup message
+    chat_id = os.getenv("TELEGRAM_CHAT_ID", "")
+    if chat_id:
+        await app.bot.send_message(
+            chat_id=chat_id,
+            text=(
+                f"<b>Bot Started</b>\n\n"
+                f"Mode: {args.mode.upper()}\n"
+                f"Capital: ${args.capital:.2f}\n"
+                f"Interval: {args.interval}s\n\n"
+                f"Use /help for commands"
+            ),
+            parse_mode="HTML",
+        )
+
+    # Main scan loop
+    async with aiohttp.ClientSession() as session:
+        http_session_holder[0] = session
+        try:
+            while True:
+                try:
+                    signals = await run_scan(session, state)
+                    if signals and chat_id:
+                        for sig in signals[:2]:
+                            m = sig["market"]
+                            await app.bot.send_message(
+                                chat_id=chat_id,
+                                text=(
+                                    f"<b>SIGNAL: {sig['direction']}</b>\n"
+                                    f"{m.question[:60]}\n"
+                                    f"Edge: {sig['edge']*100:.1f}% | "
+                                    f"Size: ${sig['size']:.2f} | "
+                                    f"Cat: {m.category}"
+                                ),
+                                parse_mode="HTML",
+                            )
+                except Exception as e:
+                    logger.error(f"Scan error: {e}")
+
+                await asyncio.sleep(args.interval)
+        except asyncio.CancelledError:
+            pass
+        finally:
+            http_session_holder[0] = None
+
+    # Cleanup
+    await app.updater.stop()
+    await app.stop()
+    await app.shutdown()
+
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("Bot stopped.")

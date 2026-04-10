@@ -13,7 +13,7 @@ MIN_CONFIDENCE: float = 0.70
 STOP_LOSS_RATIO: float = 0.5
 
 # === POSITION SIZING ===
-KELLY_FRACTION: float = 0.5
+KELLY_FRACTION: float = 0.25  # Quarter-Kelly: less volatile than half-Kelly
 MIN_TRADE_SIZE: float = 0.50
 MAX_TRADE_SIZE: float = 5.00
 MAX_POSITION_USD: float = 5.00
