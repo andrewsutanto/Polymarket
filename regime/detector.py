@@ -28,24 +28,29 @@ class Regime(str, Enum):
 # Default strategy weights per regime
 DEFAULT_REGIME_WEIGHTS: dict[str, dict[str, float]] = {
     Regime.ACTIVE_WEATHER: {
-        "forecast_arb": 0.4, "forecast_momentum": 0.3,
-        "mean_reversion": 0.2, "cross_city_arb": 0.1,
+        "implied_prob_arb": 0.30, "volume_divergence": 0.20,
+        "mean_reversion": 0.20, "line_movement": 0.15,
+        "stale_market": 0.10, "cross_market_arb": 0.05,
     },
     Regime.STABLE: {
-        "cross_city_arb": 0.4, "mean_reversion": 0.3,
-        "forecast_arb": 0.2, "forecast_momentum": 0.1,
+        "cross_market_arb": 0.30, "mean_reversion": 0.25,
+        "implied_prob_arb": 0.20, "stale_market": 0.10,
+        "volume_divergence": 0.10, "line_movement": 0.05,
     },
     Regime.CONSENSUS: {
-        "cross_city_arb": 0.5, "mean_reversion": 0.3,
-        "forecast_arb": 0.1, "forecast_momentum": 0.1,
+        "cross_market_arb": 0.35, "mean_reversion": 0.25,
+        "stale_market": 0.15, "implied_prob_arb": 0.10,
+        "volume_divergence": 0.10, "line_movement": 0.05,
     },
     Regime.DISAGREEMENT: {
-        "forecast_arb": 0.5, "forecast_momentum": 0.3,
-        "mean_reversion": 0.1, "cross_city_arb": 0.1,
+        "implied_prob_arb": 0.35, "volume_divergence": 0.25,
+        "line_movement": 0.20, "mean_reversion": 0.10,
+        "stale_market": 0.05, "cross_market_arb": 0.05,
     },
     Regime.NEUTRAL: {
-        "forecast_arb": 0.25, "forecast_momentum": 0.25,
-        "mean_reversion": 0.25, "cross_city_arb": 0.25,
+        "implied_prob_arb": 0.20, "mean_reversion": 0.20,
+        "volume_divergence": 0.15, "line_movement": 0.15,
+        "stale_market": 0.15, "cross_market_arb": 0.15,
     },
 }
 

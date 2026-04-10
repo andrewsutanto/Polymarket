@@ -14,10 +14,12 @@ from strategies.base import BaseStrategy, Signal
 logger = logging.getLogger(__name__)
 
 DEFAULT_WEIGHTS = {
-    "forecast_arb": 0.35,
-    "mean_reversion": 0.25,
-    "forecast_momentum": 0.25,
-    "cross_city_arb": 0.15,
+    "implied_prob_arb": 0.30,
+    "mean_reversion": 0.20,
+    "volume_divergence": 0.15,
+    "stale_market": 0.10,
+    "line_movement": 0.15,
+    "cross_market_arb": 0.10,
 }
 
 
