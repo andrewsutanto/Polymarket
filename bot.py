@@ -74,6 +74,13 @@ from core.state_manager import StateManager
 from core.bayesian_updater import BayesianUpdater
 from core.smart_money import SmartMoneyDetector
 from core.ws_feed import WSFeed
+from core.wallet_tracker import (
+    WalletScreener,
+    WalletCopyTrader,
+    WalletScoreDB,
+    WalletTrade,
+)
+from strategies.wallet_copytrade import WalletCopyTradeStrategy
 
 logging.basicConfig(
     level=logging.INFO,
@@ -220,6 +227,12 @@ class Market:
     group_item_title: str = ""     # UI grouping title
 
 
+# ── Early exit parameters (aligned with sim_environment.py) ───────
+TAKE_PROFIT_PCT = 0.20    # Exit at +20% unrealized
+STOP_LOSS_PCT = 0.30      # Exit at -30% unrealized
+TIME_EXIT_HOURS = 4.0     # Exit after 4 hours
+
+
 @dataclass
 class PaperPosition:
     token_id: str
@@ -249,6 +262,7 @@ class TradeRecord:
     edge: float
     pnl: float
     mode: str  # PAPER or LIVE
+    exit_reason: str = ""  # RESOLVED, TAKE_PROFIT, STOP_LOSS, TIME_EXIT
 
 
 # ─── Bot State ─────────────────────────────────────────────────────
@@ -297,6 +311,13 @@ class BotState:
             large_order_threshold_usd=1000.0,
             flow_window_s=3600.0,
         )
+
+        # Wallet copy-trading system
+        self.wallet_db = WalletScoreDB("data/wallet_scores.db")
+        self.wallet_screener = WalletScreener(db=self.wallet_db)
+        self.wallet_copier = WalletCopyTrader(db=self.wallet_db)
+        self.wallet_strategy = WalletCopyTradeStrategy(db_path="data/wallet_scores.db")
+        self.copytrade_enabled = False  # Off by default, toggle with /copytrade
 
         # WSFeed instance (started only when --ws flag is used)
         self.ws_feed: WSFeed | None = None
@@ -1363,6 +1384,87 @@ def build_app(state: BotState, http_session_holder: list) -> Application:
         filled = int(value / max(max_val, 0.01) * width)
         return "\u2588" * filled + "\u2591" * (width - filled)
 
+    # ── /wallets ── Show wallet watchlist with scores
+    async def cmd_wallets(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        if not authorized(update):
+            return
+        watchlist = state.wallet_screener.get_watchlist()
+        if not watchlist:
+            await update.message.reply_text(
+                "No wallets on watchlist. Run: <code>python scripts/screen_wallets.py</code>",
+                parse_mode="HTML",
+            )
+            return
+
+        lines = [
+            f"<b>Wallet Watchlist ({len(watchlist)} wallets)</b>\n"
+            f"Copy-trade: <b>{'ON' if state.copytrade_enabled else 'OFF'}</b>\n"
+        ]
+        for i, w in enumerate(watchlist[:15], 1):
+            addr_short = f"{w.address[:6]}...{w.address[-4:]}"
+            days_ago = w.recency_days
+            recency = f"{days_ago:.0f}d" if days_ago < 30 else ">30d"
+            lines.append(
+                f"{i}. <code>{addr_short}</code> "
+                f"Score: {w.score:.1f} | WR: {w.win_rate:.0%} | "
+                f"PnL: ${w.total_pnl:,.0f} | {w.total_trades} trades | {recency}"
+            )
+
+        perf = state.wallet_copier.get_copy_performance()
+        if perf["total_resolved"] > 0:
+            lines.append(
+                f"\n<b>Copy Performance</b>\n"
+                f"  Resolved: {perf['total_resolved']} | "
+                f"WR: {perf['win_rate']:.0%} | "
+                f"PnL: ${perf['total_pnl']:+,.2f} | "
+                f"Avg delay: {perf['avg_delay_s']:.0f}s"
+            )
+
+        await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+
+    # ── /copytrade ── Enable/disable copy trading
+    async def cmd_copytrade(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        if not authorized(update):
+            return
+        args_text = update.message.text.split()
+        if len(args_text) < 2:
+            ct_status = "ON" if state.copytrade_enabled else "OFF"
+            await update.message.reply_text(
+                f"Copy-trading is <b>{ct_status}</b>\n\n"
+                f"Usage: /copytrade on|off",
+                parse_mode="HTML",
+            )
+            return
+
+        subcmd = args_text[1].lower()
+        if subcmd == "on":
+            watchlist = state.wallet_screener.get_watchlist()
+            if not watchlist:
+                await update.message.reply_text(
+                    "Cannot enable: no wallets on watchlist.\n"
+                    "Run: <code>python scripts/screen_wallets.py</code>",
+                    parse_mode="HTML",
+                )
+                return
+            state.copytrade_enabled = True
+            state.wallet_copier.refresh_watchlist()
+            await update.message.reply_text(
+                f"Copy-trading <b>ENABLED</b>\n"
+                f"Watching {len(watchlist)} wallets",
+                parse_mode="HTML",
+            )
+        elif subcmd == "off":
+            state.copytrade_enabled = False
+            await update.message.reply_text(
+                "Copy-trading <b>DISABLED</b>",
+                parse_mode="HTML",
+            )
+        else:
+            await update.message.reply_text(
+                "Usage: /copytrade on|off",
+                parse_mode="HTML",
+            )
+
     # ── /help ──
     async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if not authorized(update):
@@ -1390,6 +1492,8 @@ def build_app(state: BotState, http_session_holder: list) -> Application:
             "/export &lt;csv|json&gt; — Export trade history\n"
             "/weights — Bayesian strategy weight posteriors\n"
             "/smartmoney — Recent large order flow\n"
+            "/wallets — Wallet watchlist &amp; scores\n"
+            "/copytrade on|off — Enable/disable copy-trading\n"
             "/help — This message"
         )
         await update.message.reply_text(text, parse_mode="HTML")
@@ -1436,6 +1540,8 @@ def build_app(state: BotState, http_session_holder: list) -> Application:
     app.add_handler(CommandHandler("export", cmd_export))
     app.add_handler(CommandHandler("weights", cmd_weights))
     app.add_handler(CommandHandler("smartmoney", cmd_smartmoney))
+    app.add_handler(CommandHandler("wallets", cmd_wallets))
+    app.add_handler(CommandHandler("copytrade", cmd_copytrade))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CallbackQueryHandler(handle_callback))
 
@@ -1587,6 +1693,39 @@ async def run_scan(session: aiohttp.ClientSession, state: BotState) -> list[dict
                     )
             await asyncio.sleep(0.1)
 
+    # 3c. Check for new wallet trades (copy-trading)
+    if state.copytrade_enabled and not state.kill_switch:
+        # Fetch recent trades from top markets and check for watched wallets
+        for m in top[:10]:  # Check top 10 markets for wallet activity
+            if not m.token_ids:
+                continue
+            try:
+                raw_trades = await state.wallet_screener.fetch_recent_trades(
+                    session, token_id=m.token_ids[0], limit=50,
+                )
+                if raw_trades:
+                    parsed = state.wallet_screener.parse_trades(raw_trades)
+                    # Build current prices for slippage check
+                    current_prices = {
+                        m.token_ids[0]: m.mid_price
+                        for m in state.markets.values()
+                        if m.token_ids and m.mid_price > 0
+                    }
+                    copy_signals = state.wallet_copier.check_new_trades(
+                        parsed, current_prices,
+                    )
+                    # Inject copy signals into the strategy
+                    for cs in copy_signals:
+                        state.wallet_strategy.inject_signal(cs)
+                        logger.info(
+                            "COPY SIGNAL: %s %s (wallet %s, score %.1f, delay %.0fs)",
+                            cs.direction, cs.market_id[:20],
+                            cs.wallet[:10], cs.wallet_score, cs.delay_s,
+                        )
+            except Exception as e:
+                logger.debug("Wallet trade fetch error: %s", e)
+            await asyncio.sleep(0.2)
+
     # 4. Check shadow fills + expire stale unfilled orders
     ORDER_TIMEOUT_S = 600  # Cancel unfilled limit orders after 10 minutes
     now = datetime.now(timezone.utc)
@@ -1622,8 +1761,13 @@ async def run_scan(session: aiohttp.ClientSession, state: BotState) -> list[dict
                 f"- book may be stale"
             )
 
-        # Check for resolution (price at 0 or 1)
+        # ── Exit logic: resolution, take-profit, stop-loss, time exit ──
+        exit_reason = ""
+        exit_price = 0.0
+        pnl = 0.0
+
         if m and (m.mid_price >= 0.98 or m.mid_price <= 0.02):
+            # Resolution exit
             resolution = 1.0 if m.mid_price >= 0.98 else 0.0
             if pos.direction == "BUY":
                 shares = pos.size_usd / pos.entry_price if pos.entry_price > 0 else 0
@@ -1632,20 +1776,65 @@ async def run_scan(session: aiohttp.ClientSession, state: BotState) -> list[dict
                 no_price = 1.0 - pos.entry_price
                 shares = pos.size_usd / no_price if no_price > 0 else 0
                 pnl = shares * (1.0 - resolution) - pos.size_usd
+            pnl -= pos.size_usd * 0.02  # Taker fee
+            exit_price = resolution
+            exit_reason = "RESOLVED"
 
-            # ALIGNED: Apply 2% taker fee (matches sim_environment.py)
-            pnl -= pos.size_usd * 0.02
+        elif m and pos.filled and pos.entry_price > 0:
+            # Compute unrealized return for early exit checks
+            if pos.direction == "BUY":
+                unrealized_return = m.mid_price / pos.entry_price - 1.0
+            else:
+                entry_no = 1.0 - pos.entry_price
+                current_no = 1.0 - m.mid_price
+                unrealized_return = (current_no / entry_no - 1.0) if entry_no > 0 else 0.0
 
+            # Take-profit
+            if unrealized_return > TAKE_PROFIT_PCT:
+                exit_reason = "TAKE_PROFIT"
+            # Stop-loss
+            elif unrealized_return < -STOP_LOSS_PCT:
+                exit_reason = "STOP_LOSS"
+            # Time exit
+            elif pos.opened_at:
+                try:
+                    opened = datetime.fromisoformat(pos.opened_at)
+                    hours_open = (now - opened).total_seconds() / 3600.0
+                    if hours_open > TIME_EXIT_HOURS:
+                        exit_reason = "TIME_EXIT"
+                except (ValueError, TypeError):
+                    pass
+
+            if exit_reason:
+                # Early exits sell at best_bid (taker selling into bid)
+                fill_at = m.best_bid if m.best_bid > 0 else m.mid_price
+                if pos.direction == "BUY":
+                    shares = pos.size_usd / pos.entry_price if pos.entry_price > 0 else 0
+                    pnl = shares * fill_at - pos.size_usd
+                else:
+                    entry_no = 1.0 - pos.entry_price
+                    shares = pos.size_usd / entry_no if entry_no > 0 else 0
+                    current_no = 1.0 - fill_at
+                    pnl = shares * current_no - pos.size_usd
+                pnl -= pos.size_usd * 0.02  # Taker fee on exit
+                exit_price = fill_at
+
+        if exit_reason:
             state.cash += pos.size_usd + pnl
             trade = TradeRecord(
                 timestamp=datetime.now(timezone.utc).isoformat(),
                 market_id=pos.market_id, question=pos.question,
                 category=pos.category, direction=pos.direction,
-                entry_price=pos.entry_price, exit_price=resolution,
+                entry_price=pos.entry_price, exit_price=exit_price,
                 size_usd=pos.size_usd, edge=pos.edge_at_entry,
                 pnl=round(pnl, 2), mode=state.mode.upper(),
+                exit_reason=exit_reason,
             )
             state.log_trade(trade)
+            logger.info(
+                f"{exit_reason}: {pos.direction} {pos.question[:40]} | "
+                f"PnL: ${pnl:+.2f} | {pos.entry_price:.4f} -> {exit_price:.4f}"
+            )
 
             # --- Bayesian updater: learn from resolved trade ---
             won = pnl > 0

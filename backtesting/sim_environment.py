@@ -401,6 +401,12 @@ class MarketSimulator:
 # COMPONENT 2: TRADING BOT (isolated — talks only to simulator API)
 # ═══════════════════════════════════════════════════════════════════
 
+# ── Early exit parameters (aligned with bot.py) ──────────────────
+TAKE_PROFIT_PCT = 0.20    # Exit at +20% unrealized
+STOP_LOSS_PCT = 0.30      # Exit at -30% unrealized
+TIME_EXIT_HOURS = 4.0     # Exit after 4 hours
+
+
 @dataclass
 class BotTrade:
     sim_time: float
@@ -417,6 +423,8 @@ class BotTrade:
     pnl: float = 0.0
     resolved: bool = False
     exit_price: float = 0.0
+    exit_reason: str = ""  # RESOLVED, TAKE_PROFIT, STOP_LOSS, TIME_EXIT
+    entry_time: float = 0.0  # Sim time when position was opened
 
 
 class TradingBot:
@@ -656,6 +664,7 @@ class TradingBot:
                 edge=round(total_edge, 4),
                 latency_ms=round(latency_ms, 1),
                 slippage_bps=round(slippage_bps, 1),
+                entry_time=self._api.get_sim_time(),
             )
 
             self.cash -= trade.size_usd
@@ -682,15 +691,32 @@ class TradingBot:
         return new_trades
 
     def _check_exits(self):
-        """Check if any positions should be closed."""
+        """Check if any positions should be closed.
+
+        Exit conditions (checked in priority order):
+        1. Resolution: price hit 0.98 (YES) or 0.02 (NO) — market resolved
+        2. Take-profit: unrealized P&L > +TAKE_PROFIT_PCT of position size
+        3. Stop-loss: unrealized P&L < -STOP_LOSS_PCT of position size
+        4. Time exit: position open > TIME_EXIT_HOURS in sim time
+        """
+        sim_now = self._api.get_sim_time()
+
         for mid, trade in list(self.positions.items()):
             book = self._api.get_book(trade.token_id)
             if not book:
                 continue
 
-            mid_p = (book["best_bid"] + book["best_ask"]) / 2
-            if mid_p >= 0.98 or mid_p <= 0.02:  # ALIGNED: was 0.97/0.03, bot uses 0.98/0.02
-                resolution = 1.0 if mid_p >= 0.98 else 0.0  # ALIGNED: was 0.97
+            best_bid = book["best_bid"]
+            best_ask = book["best_ask"]
+            mid_p = (best_bid + best_ask) / 2
+
+            exit_reason = ""
+            exit_price = 0.0
+            pnl = 0.0
+
+            # ── 1. Resolution exit ──────────────────────────────────
+            if mid_p >= 0.98 or mid_p <= 0.02:
+                resolution = 1.0 if mid_p >= 0.98 else 0.0
 
                 if trade.direction == "BUY":
                     shares = trade.size_usd / trade.fill_price
@@ -701,22 +727,67 @@ class TradingBot:
                     pnl = shares * (1.0 - resolution) - trade.size_usd
 
                 pnl -= trade.size_usd * 0.02  # Taker fee
+                exit_price = resolution
+                exit_reason = "RESOLVED"
 
-                trade.exit_price = resolution
-                trade.pnl = round(pnl, 4)
-                trade.resolved = True
-                self.cash += trade.size_usd + pnl
-                self._closed_markets.add(mid)  # Never re-enter
-                del self.positions[mid]
+            else:
+                # Compute unrealized return for early exit checks
+                if trade.direction == "BUY":
+                    unrealized_return = mid_p / trade.fill_price - 1.0
+                else:
+                    # SELL/NO position: profit when price drops
+                    entry_no = 1.0 - trade.fill_price
+                    current_no = 1.0 - mid_p
+                    unrealized_return = (current_no / entry_no - 1.0) if entry_no > 0 else 0.0
 
-                sim_ts = datetime.fromtimestamp(
-                    self._api.get_sim_time(), tz=timezone.utc
-                ).strftime("%H:%M:%S")
-                logger.info(
-                    "  [%s] CLOSED: %s %s | PnL: $%+.2f | %.4f -> %.4f",
-                    sim_ts, trade.direction, trade.market_id[:16],
-                    pnl, trade.fill_price, resolution,
-                )
+                # ── 2. Take-profit exit ─────────────────────────────
+                if unrealized_return > TAKE_PROFIT_PCT:
+                    exit_reason = "TAKE_PROFIT"
+
+                # ── 3. Stop-loss exit ───────────────────────────────
+                elif unrealized_return < -STOP_LOSS_PCT:
+                    exit_reason = "STOP_LOSS"
+
+                # ── 4. Time-based exit ──────────────────────────────
+                elif trade.entry_time > 0:
+                    hours_open = (sim_now - trade.entry_time) / 3600.0
+                    if hours_open > TIME_EXIT_HOURS:
+                        exit_reason = "TIME_EXIT"
+
+                if exit_reason:
+                    # Early exits sell at best_bid (taker selling into bid)
+                    fill_at = best_bid
+
+                    if trade.direction == "BUY":
+                        shares = trade.size_usd / trade.fill_price
+                        pnl = shares * fill_at - trade.size_usd
+                    else:
+                        entry_no = 1.0 - trade.fill_price
+                        shares = trade.size_usd / entry_no if entry_no > 0 else 0
+                        current_no = 1.0 - fill_at
+                        pnl = shares * current_no - trade.size_usd
+
+                    pnl -= trade.size_usd * 0.02  # Taker fee on exit
+                    exit_price = fill_at
+
+            if not exit_reason:
+                continue
+
+            # ── Record and close ────────────────────────────────────
+            trade.exit_price = exit_price
+            trade.pnl = round(pnl, 4)
+            trade.resolved = True
+            trade.exit_reason = exit_reason
+            self.cash += trade.size_usd + pnl
+            self._closed_markets.add(mid)  # Never re-enter
+            del self.positions[mid]
+
+            sim_ts = datetime.fromtimestamp(sim_now, tz=timezone.utc).strftime("%H:%M:%S")
+            logger.info(
+                "  [%s] %s: %s %s | PnL: $%+.2f | %.4f -> %.4f",
+                sim_ts, exit_reason, trade.direction, trade.market_id[:16],
+                pnl, trade.fill_price, exit_price,
+            )
 
     def report(self) -> dict:
         """Generate final performance report."""
@@ -766,6 +837,20 @@ class TradingBot:
             stats["worst_trade"] = round(min(pnls), 2)
             if np.std(pnls) > 0:
                 stats["sharpe"] = round(np.mean(pnls) / np.std(pnls) * np.sqrt(len(pnls)), 2)
+
+            # Breakdown by exit type
+            exit_types = defaultdict(list)
+            for t in resolved:
+                reason = t.exit_reason or "RESOLVED"
+                exit_types[reason].append(t.pnl)
+            for reason in ["RESOLVED", "TAKE_PROFIT", "STOP_LOSS", "TIME_EXIT"]:
+                if reason in exit_types:
+                    pnl_list = exit_types[reason]
+                    n = len(pnl_list)
+                    w = sum(1 for p in pnl_list if p > 0)
+                    stats[f"exit_{reason.lower()}_count"] = n
+                    stats[f"exit_{reason.lower()}_pnl"] = round(sum(pnl_list), 2)
+                    stats[f"exit_{reason.lower()}_wr"] = round(w / n * 100, 1) if n else 0
 
         if self.trades:
             stats["avg_latency_ms"] = round(np.mean([t.latency_ms for t in self.trades]), 1)
@@ -864,7 +949,11 @@ def run_simulation(
         print(f"  {'-' * 85}")
         for i, t in enumerate(bot.trades):
             ts = datetime.fromtimestamp(t.sim_time, tz=timezone.utc).strftime("%H:%M:%S")
-            pnl_str = f"${t.pnl:+.2f}" if t.resolved else "OPEN"
+            if t.resolved:
+                reason_tag = t.exit_reason or "RESOLVED"
+                pnl_str = f"${t.pnl:+.2f} [{reason_tag}]"
+            else:
+                pnl_str = "OPEN"
             print(
                 f"  {i+1:<3} {ts:<10} {t.direction:<5} {t.market_id[:16]:<18} "
                 f"{t.signal_price:>8.4f} {t.fill_price:>8.4f} "
