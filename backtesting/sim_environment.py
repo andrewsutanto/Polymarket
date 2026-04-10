@@ -51,6 +51,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from core.markov_model import MarkovModel
 from core.bias_calibrator import BiasCalibrator
+from strategies.calibration_edge import CalibrationEdgeStrategy
 
 logging.basicConfig(
     level=logging.INFO,
@@ -426,7 +427,16 @@ class TradingBot:
     sim.get_price_history() — same as calling real Polymarket APIs.
     """
 
-    def __init__(self, sim: MarketSimulator, capital: float = 1000.0):
+    def __init__(self, sim: MarketSimulator, capital: float = 1000.0, strategy: str = "calibration"):
+        """Initialize the trading bot.
+
+        Args:
+            sim: MarketSimulator instance (treated as opaque API).
+            capital: Starting capital in USD.
+            strategy: Which strategy to use:
+                "calibration" (default) — calibration edge strategy
+                "markov" — legacy Markov chain model
+        """
         # The bot only has a reference to the simulator's PUBLIC API
         # It cannot access sim._events, sim._markets directly, etc.
         self._api = sim  # Treated as an opaque API endpoint
@@ -435,8 +445,24 @@ class TradingBot:
         self.positions: dict[str, BotTrade] = {}
         self.trades: list[BotTrade] = []
         self._closed_markets: set[str] = set()
-        self.markov = MarkovModel(n_states=10, n_simulations=5000)  # ALIGNED: was 2000, bot uses 5000
-        self.markov.reset()
+
+        # Strategy selection
+        self._strategy_name = strategy
+        if strategy == "markov":
+            self.markov = MarkovModel(n_states=10, n_simulations=5000)
+            self.markov.reset()
+            self.calibration_strategy = None
+        else:
+            self.markov = None
+            self.calibration_strategy = CalibrationEdgeStrategy(
+                min_edge=0.035,            # 3.5% raw edge threshold
+                taker_fee=0.02,            # 2% taker fee
+                min_fee_adjusted_edge=0.015,  # 1.5% after fees
+                use_feature_adjustment=True,
+                max_spread=0.10,
+                category_scaling=True,
+            )
+
         self.calibrator = BiasCalibrator()
         self._max_trades = 999  # ALIGNED: bot has no trade cap (was 50)
         self._max_positions = 5  # ALIGNED: matches bot
@@ -449,6 +475,8 @@ class TradingBot:
         self._high_conviction_edge = 0.06
         self._peak_value = capital
         self._daily_start_value = capital
+
+        logger.info("  Strategy: %s", self._strategy_name.upper())
 
     def scan_and_trade(self) -> list[BotTrade]:
         """Run one scan cycle — exactly as the live bot would.
@@ -507,37 +535,74 @@ class TradingBot:
             signal_price = current_price
             eval_start = time.time()
 
-            estimate = self.markov.estimate(
-                mid, history, current_price,
-                horizon_steps=20, calibrator=self.calibrator,
-            )
+            if self._strategy_name == "calibration":
+                # ── CALIBRATION EDGE STRATEGY ──
+                # Build market_data dict matching BaseStrategy interface
+                market_data = {
+                    "market_id": mid,
+                    "token_id": tid,
+                    "market_slug": mid[:16],
+                    "category": "other",
+                    "outcome": "Yes",
+                    "yes_price": current_price,
+                    "no_price": 1.0 - current_price,
+                    "mid_price": current_price,
+                    "spread": mkt["spread"],
+                    "best_bid": mkt["best_bid"],
+                    "best_ask": mkt["best_ask"],
+                    "book_depth": 0.0,
+                    "volume_24h": 0.0,
+                    "time_to_resolution_hrs": 999.0,
+                    "has_position": False,
+                    "price_history": history,
+                }
 
-            eval_end = time.time()
-            latency_ms = (eval_end - eval_start) * 1000
+                signal = self.calibration_strategy.generate_signal(market_data)
 
-            if estimate.confidence < 0.3:
-                continue
+                eval_end = time.time()
+                latency_ms = (eval_end - eval_start) * 1000
 
-            # ALIGNED: Use category multiplier like bot.py (not hardcoded 1.2)
-            cal_edge = estimate.calibrated_probability - current_price
-            cat_mult = self.calibrator.get_category_multiplier("other")  # Default; no question text in sim
-            no_edge = self.calibrator.get_no_side_edge(current_price)
+                if signal is None:
+                    continue
 
-            # ALIGNED: No maker edge (sim fills as taker at bid/ask)
-            # Bot adds MAKER=0.0112 but that's inconsistent with taker fills
-            if cal_edge < 0:
-                total_edge = abs(cal_edge) * cat_mult + no_edge * 0.4
-                direction = "SELL"
-                price_for_kelly = 1.0 - current_price
-            elif cal_edge > 0:
-                total_edge = cal_edge * cat_mult * 0.7
-                direction = "BUY"
-                price_for_kelly = current_price
+                total_edge = signal.edge
+                direction = signal.direction
+                # For Kelly sizing: price of the side we're buying
+                if signal.outcome == "No":
+                    price_for_kelly = 1.0 - current_price
+                else:
+                    price_for_kelly = current_price
+
             else:
-                continue
+                # ── LEGACY MARKOV STRATEGY ──
+                estimate = self.markov.estimate(
+                    mid, history, current_price,
+                    horizon_steps=20, calibrator=self.calibrator,
+                )
 
-            if total_edge < 0.035:
-                continue
+                eval_end = time.time()
+                latency_ms = (eval_end - eval_start) * 1000
+
+                if estimate.confidence < 0.3:
+                    continue
+
+                cal_edge = estimate.calibrated_probability - current_price
+                cat_mult = self.calibrator.get_category_multiplier("other")
+                no_edge = self.calibrator.get_no_side_edge(current_price)
+
+                if cal_edge < 0:
+                    total_edge = abs(cal_edge) * cat_mult + no_edge * 0.4
+                    direction = "SELL"
+                    price_for_kelly = 1.0 - current_price
+                elif cal_edge > 0:
+                    total_edge = cal_edge * cat_mult * 0.7
+                    direction = "BUY"
+                    price_for_kelly = current_price
+                else:
+                    continue
+
+                if total_edge < 0.035:
+                    continue
 
             # ALIGNED: High-conviction mode when cash is low
             cash_ratio = self.cash / max(self.capital, 0.01)
@@ -721,6 +786,7 @@ def run_simulation(
     capital: float = 1000.0,
     speed: float = 0.0,
     scan_interval_events: int = 20000,
+    strategy: str = "calibration",
 ) -> dict:
     """Run the full simulated environment.
 
@@ -729,11 +795,11 @@ def run_simulation(
     This means a 7GB RAM machine can handle any number of files.
     """
     sim = MarketSimulator(speed=speed)
-    bot = TradingBot(sim, capital=capital)
+    bot = TradingBot(sim, capital=capital, strategy=strategy)
 
     logger.info("=" * 70)
     logger.info("  SIMULATED LIVE ENVIRONMENT")
-    logger.info("  Files: %d | Capital: $%.0f", len(parquet_paths), capital)
+    logger.info("  Files: %d | Capital: $%.0f | Strategy: %s", len(parquet_paths), capital, strategy.upper())
     logger.info("  Bot sees ONLY current market state (no future data)")
     logger.info("  Fills at ACTUAL book price at fill time (not eval time)")
     logger.info("  STREAMING: never holds more than 1M events in memory")
@@ -840,6 +906,9 @@ def main():
                         help="0=fast, 1=realtime, 60=60x speed")
     parser.add_argument("--scan-every", type=int, default=20000,
                         help="Bot scans every N events")
+    parser.add_argument("--strategy", choices=["calibration", "markov"],
+                        default="calibration",
+                        help="Trading strategy: calibration (default) or markov (legacy)")
     args = parser.parse_args()
 
     files = []
@@ -854,6 +923,7 @@ def main():
         capital=args.capital,
         speed=args.speed,
         scan_interval_events=args.scan_every,
+        strategy=args.strategy,
     )
 
 
