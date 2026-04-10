@@ -438,8 +438,9 @@ class TradingBot:
         self.markov = MarkovModel(n_states=10, n_simulations=5000)  # ALIGNED: was 2000, bot uses 5000
         self.markov.reset()
         self.calibrator = BiasCalibrator()
-        self._max_trades = 50
-        self._max_positions = 5  # ALIGNED: was 10, bot uses 5
+        self._max_trades = 999  # ALIGNED: bot has no trade cap (was 50)
+        self._max_positions = 5  # ALIGNED: matches bot
+        self._max_signals_per_scan = 3  # ALIGNED: bot executes top 3 per scan
         # Risk management — aligned with bot.py check_risk()
         self._max_drawdown_pct = 0.30
         self._daily_loss_pct = 0.05
@@ -563,6 +564,11 @@ class TradingBot:
             if size < 0.50 or self.cash < size:
                 continue
 
+            # ALIGNED: Max position size = 10% of portfolio value
+            total_val = self.cash + sum(t.size_usd for t in self.positions.values())
+            if size > total_val * self._max_position_pct:
+                continue
+
             # ── FILL (at CURRENT book state, not eval-time state) ──
             # During our evaluation, the market kept moving.
             # The simulator advanced. The fill price reflects reality.
@@ -593,6 +599,10 @@ class TradingBot:
             new_trades.append(trade)
 
             sim_ts = datetime.fromtimestamp(trade.sim_time, tz=timezone.utc).strftime("%H:%M:%S")
+
+            # ALIGNED: Bot executes max 3 signals per scan (bot.py line 1675)
+            if len(new_trades) >= self._max_signals_per_scan:
+                break
             logger.info(
                 "  [%s] TRADE #%d: %s %s | $%.2f | signal: %.4f -> fill: %.4f | "
                 "edge: %.1f%% | latency: %.0fms | slip: %.0fbps",
@@ -615,7 +625,7 @@ class TradingBot:
 
             mid_p = (book["best_bid"] + book["best_ask"]) / 2
             if mid_p >= 0.98 or mid_p <= 0.02:  # ALIGNED: was 0.97/0.03, bot uses 0.98/0.02
-                resolution = 1.0 if mid_p >= 0.97 else 0.0
+                resolution = 1.0 if mid_p >= 0.98 else 0.0  # ALIGNED: was 0.97
 
                 if trade.direction == "BUY":
                     shares = trade.size_usd / trade.fill_price

@@ -1633,6 +1633,9 @@ async def run_scan(session: aiohttp.ClientSession, state: BotState) -> list[dict
                 shares = pos.size_usd / no_price if no_price > 0 else 0
                 pnl = shares * (1.0 - resolution) - pos.size_usd
 
+            # ALIGNED: Apply 2% taker fee (matches sim_environment.py)
+            pnl -= pos.size_usd * 0.02
+
             state.cash += pos.size_usd + pnl
             trade = TradeRecord(
                 timestamp=datetime.now(timezone.utc).isoformat(),
