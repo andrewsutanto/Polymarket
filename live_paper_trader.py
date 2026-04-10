@@ -94,6 +94,17 @@ class PaperTrade:
 
 
 @dataclass
+class RiskConfig:
+    """Risk rules inspired by LobeHub paper trader."""
+    max_position_pct: float = 0.10       # Max 10% of portfolio per trade
+    max_drawdown_pct: float = 0.30       # Stop trading at 30% drawdown
+    max_concurrent_positions: int = 5    # Max 5 open positions
+    daily_loss_limit_pct: float = 0.05   # 5% daily loss limit
+    max_market_exposure_pct: float = 0.20  # Max 20% in single market
+    high_conviction_only_pct: float = 0.30  # Only high-conviction when cash < 30%
+
+
+@dataclass
 class Portfolio:
     starting_capital: float
     cash: float
@@ -102,6 +113,9 @@ class Portfolio:
     wins: int = 0
     total_pnl: float = 0.0
     peak_value: float = 0.0
+    daily_pnl: float = 0.0
+    daily_start_value: float = 0.0
+    risk: RiskConfig = field(default_factory=RiskConfig)
 
     @property
     def win_rate(self) -> float:
@@ -109,13 +123,46 @@ class Portfolio:
 
     @property
     def value(self) -> float:
-        # Cash + marked-to-market positions
         pos_value = sum(p.get("size", 0) for p in self.positions.values())
         return self.cash + pos_value
 
     @property
     def return_pct(self) -> float:
         return (self.value - self.starting_capital) / self.starting_capital * 100
+
+    @property
+    def drawdown_pct(self) -> float:
+        if self.peak_value <= 0:
+            return 0.0
+        return (self.peak_value - self.value) / self.peak_value
+
+    def check_risk(self, size_usd: float, edge: float) -> tuple[bool, str]:
+        """Validate trade against risk rules. Returns (allowed, reason)."""
+        # Max drawdown kill switch
+        if self.drawdown_pct >= self.risk.max_drawdown_pct:
+            return False, f"drawdown {self.drawdown_pct:.1%} >= {self.risk.max_drawdown_pct:.0%} limit"
+
+        # Max concurrent positions
+        if len(self.positions) >= self.risk.max_concurrent_positions:
+            return False, f"max {self.risk.max_concurrent_positions} concurrent positions"
+
+        # Daily loss limit
+        if self.daily_start_value > 0:
+            daily_loss = (self.daily_start_value - self.value) / self.daily_start_value
+            if daily_loss >= self.risk.daily_loss_limit_pct:
+                return False, f"daily loss {daily_loss:.1%} >= {self.risk.daily_loss_limit_pct:.0%} limit"
+
+        # Max position size (% of portfolio)
+        max_size = self.value * self.risk.max_position_pct
+        if size_usd > max_size:
+            return False, f"size ${size_usd:.2f} > {self.risk.max_position_pct:.0%} of portfolio (${max_size:.2f})"
+
+        # High-conviction only mode (when cash is low)
+        cash_ratio = self.cash / max(self.starting_capital, 0.01)
+        if cash_ratio < self.risk.high_conviction_only_pct and edge < 0.06:
+            return False, f"cash {cash_ratio:.0%} < {self.risk.high_conviction_only_pct:.0%}, need edge > 6%"
+
+        return True, "ok"
 
 
 # ─── Database ──────────────────────────────────────────────────────
@@ -246,6 +293,59 @@ async def fetch_price_history(session: aiohttp.ClientSession, token_id: str) -> 
     return []
 
 
+# ─── Order Book Walking (realistic fills) ────────────────────────
+
+def walk_book(
+    levels: list[dict],
+    size_usd: float,
+    side: str = "buy",
+) -> tuple[float, float]:
+    """Simulate filling an order by walking the order book.
+
+    Instead of using mid-price + flat slippage, this walks through
+    actual order book levels to compute a realistic VWAP fill price.
+
+    Args:
+        levels: List of {"price": str, "size": str} from CLOB API.
+               For buy orders, use asks (ascending price).
+               For sell orders, use bids (descending price).
+        size_usd: Dollar amount to fill.
+        side: "buy" or "sell".
+
+    Returns:
+        (vwap_fill_price, filled_usd) — may be partially filled.
+    """
+    if not levels:
+        return 0.0, 0.0
+
+    total_cost = 0.0
+    total_shares = 0.0
+    remaining_usd = size_usd
+
+    for level in levels:
+        price = float(level.get("price", 0))
+        size = float(level.get("size", 0))
+        if price <= 0 or size <= 0:
+            continue
+
+        level_usd = price * size  # total USD at this level
+        take_usd = min(remaining_usd, level_usd)
+        take_shares = take_usd / price
+
+        total_cost += take_usd
+        total_shares += take_shares
+        remaining_usd -= take_usd
+
+        if remaining_usd <= 0.001:
+            break
+
+    if total_shares <= 0:
+        return 0.0, 0.0
+
+    vwap = total_cost / total_shares
+    return round(vwap, 6), round(total_cost, 4)
+
+
 # ─── Trading Logic ─────────────────────────────────────────────────
 
 def kelly_size(edge: float, price: float, bankroll: float) -> float:
@@ -360,7 +460,10 @@ async def run(interval: int = 120, capital: float = 50.0):
 
     markov = MarkovModel(n_states=10, n_simulations=5000)
     calibrator = BiasCalibrator()
-    portfolio = Portfolio(starting_capital=capital, cash=capital, peak_value=capital)
+    portfolio = Portfolio(
+        starting_capital=capital, cash=capital,
+        peak_value=capital, daily_start_value=capital,
+    )
     db = init_db()
 
     tracked_markets: dict[str, LiveMarket] = {}
@@ -486,20 +589,43 @@ async def run(interval: int = 120, capital: float = 50.0):
                         m.price_history.append(m.mid_price)
                 await asyncio.sleep(0.1)
 
-            # 4. Evaluate opportunities
+            # 4. Evaluate opportunities (with risk checks + book walking)
             trades_this_cycle = 0
             for m in top_markets:
                 trade = await evaluate_market(m, markov, calibrator, portfolio)
                 if trade and trades_this_cycle < 3:  # Max 3 trades per cycle
-                    # Simulate fill
+                    # Risk check
+                    allowed, reason = portfolio.check_risk(trade.size_usd, trade.edge)
+                    if not allowed:
+                        logger.info(f"  RISK BLOCKED: {reason} | {m.question[:40]}")
+                        continue
+
+                    # Simulate fill delay
                     await asyncio.sleep(trade.fill_delay_ms / 1000.0)
 
-                    # Apply slippage (0.5% adverse)
-                    if trade.direction == "BUY":
-                        fill_price = trade.entry_price * 1.005
+                    # Order book walking for realistic fill price
+                    book = await fetch_book(session, m.token_ids[0])
+                    if book:
+                        if trade.direction == "BUY":
+                            asks = book.get("asks", [])
+                            fill_price, filled_usd = walk_book(asks, trade.size_usd, "buy")
+                        else:
+                            bids = book.get("bids", [])
+                            fill_price, filled_usd = walk_book(bids, trade.size_usd, "sell")
+
+                        if fill_price > 0 and filled_usd > 0:
+                            trade.entry_price = fill_price
+                            trade.size_usd = min(trade.size_usd, filled_usd)
+                        else:
+                            logger.info(f"  NO FILL: empty book for {m.question[:40]}")
+                            continue
                     else:
-                        fill_price = trade.entry_price * 0.995
-                    trade.entry_price = round(fill_price, 4)
+                        # Fallback: use mid-price with 0.5% slippage
+                        if trade.direction == "BUY":
+                            trade.entry_price = round(trade.entry_price * 1.005, 4)
+                        else:
+                            trade.entry_price = round(trade.entry_price * 0.995, 4)
+
                     trade.status = "FILLED"
 
                     # Update portfolio
@@ -518,7 +644,7 @@ async def run(interval: int = 120, capital: float = 50.0):
                     log_trade(db, trade)
 
                     logger.info(
-                        f"  📊 TRADE: {trade.direction} {m.question[:50]}"
+                        f"  TRADE: {trade.direction} {m.question[:50]}"
                         f"\n           @ {trade.entry_price:.4f} | ${trade.size_usd:.2f} | "
                         f"edge: {trade.edge*100:.1f}% | delay: {trade.fill_delay_ms}ms"
                     )

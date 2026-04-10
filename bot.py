@@ -664,6 +664,83 @@ def build_app(state: BotState, http_session_holder: list) -> Application:
                 text += f"  {name}: {w:.4f}\n"
         await update.message.reply_text(text, parse_mode="HTML")
 
+    # ── /arb ── Combinatorial arbitrage scan
+    async def cmd_arb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        if not authorized(update):
+            return
+        await update.message.reply_text("Scanning for combinatorial arbitrage...")
+
+        try:
+            from core.combinatorial_arb import CombinatorialArbEngine
+
+            engine = CombinatorialArbEngine(min_profit_pct=0.3)
+            market_dicts = []
+            for m in state.markets.values():
+                market_dicts.append({
+                    "condition_id": m.condition_id,
+                    "question": m.question,
+                    "slug": m.slug,
+                    "category": m.category,
+                    "outcomes": m.outcomes,
+                    "outcome_prices": [m.yes_price, m.no_price],
+                    "tokens": [{"token_id": t} for t in m.token_ids],
+                    "tags": [],
+                    "liquidity": m.liquidity,
+                    "volume_24h": m.volume_24h,
+                })
+
+            clusters = engine.build_clusters(market_dicts)
+            opps = engine.detect_arbitrage(clusters)
+            stats = engine.get_stats()
+
+            text = f"<b>Combinatorial Arbitrage Scan</b>\n\n"
+            text += f"Markets scanned: {len(state.markets)}\n"
+            text += f"Clusters found: {stats['total_clusters']}\n"
+            text += f"  Mutex: {stats['mutex_clusters']}\n"
+            text += f"  Rebalancing: {stats['rebalancing_clusters']}\n"
+            text += f"Opportunities: {len(opps)}\n"
+
+            if opps:
+                text += f"\n<b>Top Opportunities:</b>\n"
+                for opp in opps[:5]:
+                    text += (
+                        f"\n{opp.arb_type} | ROI: {opp.roi_pct:+.2f}%\n"
+                        f"  Profit: ${opp.guaranteed_profit:.4f}\n"
+                        f"  Cost: ${opp.total_cost:.4f}\n"
+                        f"  Legs: {len(opp.legs)}\n"
+                        f"  {opp.description[:60]}\n"
+                    )
+            else:
+                text += "\nNo profitable arbitrage found at current prices."
+
+            await update.message.reply_text(text, parse_mode="HTML")
+        except Exception as e:
+            await update.message.reply_text(f"Arb scan error: {e}")
+
+    # ── /risk ── Show risk rules and status
+    async def cmd_risk(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        if not authorized(update):
+            return
+        n_pos = len(state.positions)
+        total_value = state.cash + sum(p.size_usd for p in state.positions.values())
+        peak = max(total_value, state.capital)
+        dd = (peak - total_value) / peak * 100 if peak > 0 else 0
+
+        text = (
+            f"<b>Risk Status</b>\n\n"
+            f"Positions: {n_pos}/5 max\n"
+            f"Drawdown: {dd:.1f}% (limit: 30%)\n"
+            f"Cash ratio: {state.cash/max(state.capital,0.01)*100:.0f}%\n\n"
+            f"<b>Risk Rules:</b>\n"
+            f"  Max position: 10% of portfolio\n"
+            f"  Max drawdown: 30%\n"
+            f"  Max concurrent: 5 positions\n"
+            f"  Daily loss limit: 5%\n"
+            f"  Single market cap: 20%\n"
+            f"  Low-cash mode: edge > 6% only\n"
+        )
+        await update.message.reply_text(text, parse_mode="HTML")
+
     # ── /help ──
     async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if not authorized(update):
@@ -677,12 +754,14 @@ def build_app(state: BotState, http_session_holder: list) -> Application:
             "/pnl — P&L breakdown\n"
             "/scan — Manual market scan\n"
             "/opportunities — Current signals\n"
+            "/arb — Combinatorial arbitrage scan\n"
             "/markets — Market universe\n"
             "/mode — Toggle paper/live\n"
             "/capital &lt;amt&gt; — Set paper capital\n"
             "/kill — Emergency stop\n"
             "/resume — Resume trading\n"
             "/stats — Alpha combiner stats\n"
+            "/risk — Risk rules &amp; status\n"
             "/help — This message"
         )
         await update.message.reply_text(text, parse_mode="HTML")
@@ -721,6 +800,8 @@ def build_app(state: BotState, http_session_holder: list) -> Application:
     app.add_handler(CommandHandler("kill", cmd_kill))
     app.add_handler(CommandHandler("resume", cmd_resume))
     app.add_handler(CommandHandler("stats", cmd_stats))
+    app.add_handler(CommandHandler("arb", cmd_arb))
+    app.add_handler(CommandHandler("risk", cmd_risk))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CallbackQueryHandler(handle_callback))
 
