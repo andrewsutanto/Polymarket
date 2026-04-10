@@ -12,6 +12,7 @@ Usage:
 
     python bot.py --mode paper --capital 50
     python bot.py --mode live
+    python bot.py --mode paper --ws   # Enable WebSocket feed
 
 Telegram Commands:
     /start          — Welcome + mode info
@@ -27,6 +28,8 @@ Telegram Commands:
     /kill           — Emergency stop all trading
     /resume         — Resume trading after kill
     /stats          — Fundamental Law stats (IC, effective-N, IR)
+    /weights        — Bayesian strategy weight posteriors
+    /smartmoney     — Recent large order flow
     /config         — Show/edit strategy parameters
     /help           — Command reference
 """
@@ -1383,6 +1386,8 @@ def build_app(state: BotState, http_session_holder: list) -> Application:
             "/alerts — Configure price alerts\n"
             "/performance — Rich analytics &amp; sparklines\n"
             "/export &lt;csv|json&gt; — Export trade history\n"
+            "/weights — Bayesian strategy weight posteriors\n"
+            "/smartmoney — Recent large order flow\n"
             "/help — This message"
         )
         await update.message.reply_text(text, parse_mode="HTML")
@@ -1427,6 +1432,8 @@ def build_app(state: BotState, http_session_holder: list) -> Application:
     app.add_handler(CommandHandler("alerts", cmd_alerts))
     app.add_handler(CommandHandler("performance", cmd_performance))
     app.add_handler(CommandHandler("export", cmd_export))
+    app.add_handler(CommandHandler("weights", cmd_weights))
+    app.add_handler(CommandHandler("smartmoney", cmd_smartmoney))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CallbackQueryHandler(handle_callback))
 
@@ -1514,6 +1521,13 @@ async def run_scan(session: aiohttp.ClientSession, state: BotState) -> list[dict
             if history:
                 m.price_history = history
             await asyncio.sleep(0.1)
+
+    # 2b. Ensure WSFeed is tracking tokens for top markets
+    if state.ws_feed:
+        for m in sorted(state.markets.values(), key=lambda x: -x.volume_24h)[:30]:
+            if m.token_ids:
+                outcome = m.outcomes[0] if m.outcomes else "Yes"
+                state.ws_feed.track_token(m.token_ids[0], m.condition_id, outcome)
 
     # 3. Fetch live orderbooks for top markets
     #    If WSFeed is active, use its snapshots instead of REST polling
@@ -1724,15 +1738,24 @@ async def main():
     parser.add_argument("--mode", choices=["paper", "live"], default="paper")
     parser.add_argument("--capital", type=float, default=50.0)
     parser.add_argument("--interval", type=int, default=120, help="Scan interval seconds")
+    parser.add_argument(
+        "--ws", action="store_true", default=False,
+        help="Use WebSocket feed for real-time orderbook data instead of REST polling",
+    )
     args = parser.parse_args()
 
     state = BotState(mode=args.mode, capital=args.capital)
     http_session_holder = [None]
 
+    # Initialize WSFeed if --ws flag is set
+    if args.ws:
+        state.ws_feed = WSFeed()
+
     logger.info("Starting Polymarket Bot...")
     logger.info(f"  Mode: {args.mode.upper()}")
     logger.info(f"  Capital: ${args.capital:.2f}")
     logger.info(f"  Interval: {args.interval}s")
+    logger.info(f"  WebSocket: {'ON' if args.ws else 'OFF'}")
 
     app = build_app(state, http_session_holder)
 
@@ -1756,6 +1779,11 @@ async def main():
             ),
             parse_mode="HTML",
         )
+
+    # Start WSFeed if enabled
+    if state.ws_feed:
+        await state.ws_feed.start()
+        logger.info("WSFeed started — real-time orderbook via WebSocket")
 
     # Main scan loop
     async with aiohttp.ClientSession() as session:
@@ -1816,6 +1844,9 @@ async def main():
             http_session_holder[0] = None
 
     # Cleanup
+    if state.ws_feed:
+        await state.ws_feed.stop()
+        logger.info("WSFeed stopped")
     await app.updater.stop()
     await app.stop()
     await app.shutdown()
