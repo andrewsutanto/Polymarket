@@ -1,0 +1,176 @@
+name: Daily Alpha Pipeline
+
+on:
+  schedule:
+    # Run daily at 9am UTC
+    - cron: '0 9 * * *'
+  workflow_dispatch:  # Also allow manual trigger
+
+permissions:
+  contents: write  # Needed to push pipeline_log.md
+
+jobs:
+  # Job 1: Download latest data
+  data-check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      new_files: ${{ steps.check.outputs.new_files }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check for new PMXT archive files
+        id: check
+        run: |
+          echo "Checking archive.pmxt.dev for new files..."
+          # Get latest file listing
+          curl -s "https://archive.pmxt.dev/Polymarket" | grep -o 'polymarket_orderbook_[0-9T-]*\.parquet' | sort -u | tail -10 > /tmp/available.txt
+          echo "Latest 10 files available:"
+          cat /tmp/available.txt
+
+          # Check if today's files exist
+          TODAY=$(date -u +%Y-%m-%d)
+          NEW=$(grep "$TODAY" /tmp/available.txt | wc -l)
+          echo "new_files=$NEW" >> $GITHUB_OUTPUT
+          echo "New files for today: $NEW"
+
+      - name: Check HuggingFace dataset updates
+        run: |
+          echo "Checking SII-WANGZJ/Polymarket_data..."
+          curl -s "https://huggingface.co/api/datasets/SII-WANGZJ/Polymarket_data" | python3 -c "
+          import sys, json
+          try:
+              data = json.load(sys.stdin)
+              print(f'Last modified: {data.get(\"lastModified\", \"unknown\")}')
+              print(f'Downloads: {data.get(\"downloads\", \"unknown\")}')
+          except: print('Could not fetch dataset info')
+          " || echo "HuggingFace check failed (non-critical)"
+
+  # Job 2: Run strategy comparison on latest data
+  strategy-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        strategy: [calibration, markov]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.11', cache: 'pip' }
+      - run: pip install -r requirements.txt
+
+      - name: Download 3 hours of PMXT data
+        run: |
+          mkdir -p data/pmxt_orderbooks
+          # Use yesterday's data (more likely to be available)
+          DATE=$(date -u -d "yesterday" +%Y-%m-%d 2>/dev/null || date -u -v-1d +%Y-%m-%d)
+          for h in 06 07 08; do
+            FILE="polymarket_orderbook_${DATE}T${h}.parquet"
+            curl -L -f -o "data/pmxt_orderbooks/${FILE}" "https://r2.pmxt.dev/${FILE}" 2>/dev/null || true
+          done
+          ls -lh data/pmxt_orderbooks/ 2>/dev/null || echo "No files downloaded"
+          # Fallback to known good date
+          COUNT=$(ls data/pmxt_orderbooks/*.parquet 2>/dev/null | wc -l)
+          if [ "$COUNT" -eq 0 ]; then
+            for h in 06 07 08; do
+              FILE="polymarket_orderbook_2026-04-08T${h}.parquet"
+              curl -L -f -o "data/pmxt_orderbooks/${FILE}" "https://r2.pmxt.dev/${FILE}"
+            done
+          fi
+
+      - name: Run ${{ matrix.strategy }} strategy
+        run: |
+          python backtesting/sim_environment.py \
+            --file data/pmxt_orderbooks/*.parquet \
+            --capital 1000 --speed 0 --scan-every 50000 \
+            --strategy ${{ matrix.strategy }} \
+            2>&1 | tee results_${{ matrix.strategy }}.txt
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: results-${{ matrix.strategy }}
+          path: results_${{ matrix.strategy }}.txt
+
+      - if: always()
+        run: |
+          echo "## ${{ matrix.strategy }} Strategy" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          tail -60 results_${{ matrix.strategy }}.txt >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+
+  # Job 3: Screen wallets for copy trading
+  wallet-screen:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.11', cache: 'pip' }
+      - run: pip install -r requirements.txt
+
+      - name: Screen wallets
+        run: |
+          python scripts/screen_wallets.py --min-trades 20 --min-winrate 0.55 2>&1 | tee wallet_report.txt || echo "Wallet screening failed (API may not expose addresses)"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: wallet-report
+          path: wallet_report.txt
+
+  # Job 4: Update pipeline log and commit
+  update-log:
+    needs: [data-check, strategy-test, wallet-screen]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: results-*
+          path: artifacts/
+          merge-multiple: true
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: wallet-report
+          path: artifacts/
+        continue-on-error: true
+
+      - name: Update pipeline log
+        run: |
+          DATE=$(date -u +%Y-%m-%d)
+          echo "" >> docs/pipeline_log.md
+          echo "## ${DATE} — Automated Pipeline Run" >> docs/pipeline_log.md
+          echo "" >> docs/pipeline_log.md
+          echo "**New PMXT files:** ${{ needs.data-check.outputs.new_files }}" >> docs/pipeline_log.md
+          echo "" >> docs/pipeline_log.md
+
+          # Append strategy results
+          for f in artifacts/results_*.txt; do
+            [ -f "$f" ] || continue
+            STRAT=$(basename $f | sed 's/results_//;s/\.txt//')
+            echo "### ${STRAT} strategy" >> docs/pipeline_log.md
+            echo '```' >> docs/pipeline_log.md
+            grep -A 15 "SIMULATION RESULTS" $f | head -15 >> docs/pipeline_log.md
+            echo '```' >> docs/pipeline_log.md
+          done
+
+          # Append wallet report if exists
+          if [ -f "artifacts/wallet_report.txt" ]; then
+            echo "### Wallet screening" >> docs/pipeline_log.md
+            echo '```' >> docs/pipeline_log.md
+            tail -20 artifacts/wallet_report.txt >> docs/pipeline_log.md
+            echo '```' >> docs/pipeline_log.md
+          fi
+
+      - name: Commit and push log
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add docs/pipeline_log.md
+          git diff --cached --quiet || git commit -m "pipeline: daily alpha run $(date -u +%Y-%m-%d)"
+          git push
