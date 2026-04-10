@@ -22,7 +22,7 @@ on:
 jobs:
   simulate:
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 180
 
     steps:
       - name: Checkout repo
@@ -43,15 +43,25 @@ jobs:
           BASE_DATE="2026-04-08"
           HOURS=${{ github.event.inputs.hours }}
 
-          for h in $(seq -w 6 $((5 + HOURS))); do
+          for h_raw in $(seq 6 $((5 + HOURS))); do
+            h=$(printf "%02d" $h_raw)
             FILE="polymarket_orderbook_${BASE_DATE}T${h}.parquet"
             URL="https://r2.pmxt.dev/${FILE}"
             echo "Downloading ${FILE}..."
-            curl -L -s -o "data/pmxt_orderbooks/${FILE}" "${URL}" -w "  %{size_download} bytes in %{time_total}s\n"
+            curl -L -f -o "data/pmxt_orderbooks/${FILE}" "${URL}" -w "  %{size_download} bytes in %{time_total}s\n"
+            if [ $? -ne 0 ]; then
+              echo "ERROR: Failed to download ${FILE}"
+              rm -f "data/pmxt_orderbooks/${FILE}"
+            fi
           done
 
           echo "Files downloaded:"
           ls -lh data/pmxt_orderbooks/
+          FILE_COUNT=$(ls data/pmxt_orderbooks/*.parquet 2>/dev/null | wc -l)
+          if [ "$FILE_COUNT" -eq 0 ]; then
+            echo "ERROR: No parquet files downloaded!"
+            exit 1
+          fi
 
       - name: Run simulated environment
         run: |
