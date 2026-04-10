@@ -1850,15 +1850,54 @@ async def run_scan(session: aiohttp.ClientSession, state: BotState) -> list[dict
             # Clean up smart money data for resolved market
             state.smart_money.clear_market(pos.market_id)
 
+            # Resolve any copy trades for this market
+            if state.copytrade_enabled:
+                state.wallet_db.resolve_copy_trade(pos.market_id, round(pnl, 2))
+
             del state.positions[tid]
 
-    # 5. Generate new signals (with smart money confirmation)
+    # 5. Generate new signals (with smart money confirmation + wallet copy)
     if not state.kill_switch:
         for m in top:
             sm_sig = state.smart_money.get_signal(m.condition_id, m.mid_price)
             sig = evaluate_market(m, state, smart_money_signal=sm_sig)
             if sig:
                 signals.append(sig)
+
+            # 5b. Check for wallet copy-trade signals
+            if state.copytrade_enabled and m.token_ids:
+                market_data = {
+                    "market_id": m.condition_id,
+                    "token_id": m.token_ids[0],
+                    "market_slug": m.slug,
+                    "category": m.category,
+                    "outcome": m.outcomes[0] if m.outcomes else "",
+                    "yes_price": m.yes_price,
+                    "mid_price": m.mid_price,
+                }
+                copy_sig = state.wallet_strategy.generate_signal(market_data)
+                if copy_sig:
+                    copy_size = state.wallet_copier.compute_copy_size(
+                        state.wallet_strategy._pending_signals.get(
+                            m.condition_id,
+                            type("_", (), {"wallet_score": copy_sig.strength * 10, "delay_s": 0})(),
+                        ),
+                        bankroll=state.cash,
+                    )
+                    if copy_size >= 0.50:
+                        signals.append({
+                            "market": m,
+                            "direction": copy_sig.direction,
+                            "edge": copy_sig.edge,
+                            "size": copy_size,
+                            "limit_price": m.best_bid if copy_sig.direction == "BUY" else m.best_ask,
+                            "markov_prob": 0.0,
+                            "confidence": copy_sig.strength,
+                            "category_mult": 1.0,
+                            "smart_money_confirms": False,
+                            "source": "wallet_copy",
+                            "wallet_meta": copy_sig.metadata,
+                        })
 
         # Update peak value for risk tracking
         state.peak_value = max(state.peak_value, state.total_value)
