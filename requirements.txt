@@ -22,3 +22,4 @@ py-clob-client>=0.15.0
 # Monitoring / logging
 structlog>=24.1.0
 statsmodels>=0.14.0
+psutil>=5.9.0

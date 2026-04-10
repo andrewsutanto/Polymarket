@@ -113,78 +113,79 @@ class MarketSimulator:
         self._started = False
         self._total_events_fed = 0
 
-    def load(self, parquet_paths: list[str], max_rows: int | None = None) -> int:
-        """Load events with FULL JSON data — no field reduction.
+    def load_and_process_file(self, fpath: str, bot_callback=None) -> int:
+        """Stream ONE file: parse row-group, apply to market state, discard.
 
-        Processes row-group by row-group to avoid the 126s to_pylist() bottleneck.
-        All fields preserved: best_bid, best_ask, token_id, side, change_price,
-        change_size, change_side — identical to what you'd see live.
+        NEVER holds more than ~1M events in memory (one row group).
+        Market state accumulates across row groups and files.
+        Bot callback is called every N events for trading decisions.
 
-        Clears previous events to free memory. Market state is preserved.
+        Args:
+            fpath: Path to a single parquet file.
+            bot_callback: Optional callable(sim) invoked periodically for trading.
+
+        Returns:
+            Number of events processed.
         """
-        # Free previous events (market state in self._markets is kept)
-        self._events.clear()
-        self._event_idx = 0
         import pyarrow.parquet as pq
+        import gc
 
-        all_events = []
-        total = 0
+        logger.info("  Streaming %s", Path(fpath).name)
+        t0 = time.time()
 
-        for fpath in sorted(parquet_paths):
-            logger.info("  Loading %s", Path(fpath).name)
-            t0 = time.time()
+        pf = pq.ParquetFile(fpath)
+        file_events = 0
+        events_since_callback = 0
+        CALLBACK_EVERY = 20000  # Bot scans every 20K events
 
-            pf = pq.ParquetFile(fpath)
-            file_events = 0
+        for rg_idx in range(pf.metadata.num_row_groups):
+            rg = pf.read_row_group(rg_idx, columns=["timestamp_received", "market_id", "data"])
+            n = rg.num_rows
 
-            # Process row-group by row-group (each ~1M rows)
-            # This avoids loading entire 23M-row file into Python at once
-            for rg_idx in range(pf.metadata.num_row_groups):
-                rg = pf.read_row_group(rg_idx, columns=["timestamp_received", "market_id", "data"])
-                n = rg.num_rows
-                total += n
+            # Process in 100K-row slices to cap memory at ~200MB per slice
+            SLICE = 100_000
+            for start in range(0, n, SLICE):
+                end = min(start + SLICE, n)
+                sl = rg.slice(start, end - start)
 
-                # Convert columns — row groups are ~1M rows, manageable
-                ts_pd = rg.column("timestamp_received").to_pandas()
-                # Timestamps are millisecond-precision (not nanoseconds)
+                ts_pd = sl.column("timestamp_received").to_pandas()
                 ts_arr = ts_pd.astype("int64").values / 1e3  # ms -> seconds
-                mid_list = rg.column("market_id").to_pylist()
-                data_list = rg.column("data").to_pylist()
+                mid_list = sl.column("market_id").to_pylist()
+                data_list = sl.column("data").to_pylist()
 
-                for i in range(n):
+                for i in range(len(data_list)):
                     raw = data_list[i]
                     if not raw:
                         continue
                     try:
-                        data = json.loads(raw)  # Full JSON — all fields preserved
-                        all_events.append({
-                            "ts": float(ts_arr[i]),
-                            "mid": mid_list[i],
-                            "data": data,
-                        })
-                        file_events += 1
+                        parsed = json.loads(raw)
                     except Exception:
                         continue
 
-                del ts_pd, ts_arr, mid_list, data_list, rg
+                    self._apply_event(ts=float(ts_arr[i]), mid=mid_list[i], data=parsed)
+                    self._sim_clock = float(ts_arr[i])
+                    file_events += 1
+                    events_since_callback += 1
 
-                if max_rows and total >= max_rows:
-                    break
+                    if bot_callback and events_since_callback >= CALLBACK_EVERY:
+                        bot_callback(self)
+                        events_since_callback = 0
 
-            elapsed = time.time() - t0
-            logger.info("    -> %d events in %.1fs (%.0f rows/sec)",
-                        file_events, elapsed, file_events / max(elapsed, 0.01))
+                # Free slice memory immediately
+                del ts_pd, ts_arr, mid_list, data_list, sl
 
-            if max_rows and total >= max_rows:
-                break
+            del rg
+            gc.collect()
 
-        # Sort chronologically
-        all_events.sort(key=lambda e: e["ts"])
-        if max_rows:
-            all_events = all_events[:max_rows]
-        self._events = all_events
-        logger.info("Loaded %d events total from %d files", len(self._events), len(parquet_paths))
-        return len(self._events)
+            logger.info("    Row group %d/%d: %d events total, %d markets",
+                        rg_idx + 1, pf.metadata.num_row_groups,
+                        file_events, len(self._markets))
+
+        elapsed = time.time() - t0
+        logger.info("    -> %d events in %.1fs (%.0f rows/sec)",
+                    file_events, elapsed, file_events / max(elapsed, 0.01))
+
+        return file_events
 
     def start(self):
         """Start the simulation clock."""
@@ -233,11 +234,17 @@ class MarketSimulator:
 
         return True
 
-    def _apply_event(self, evt: dict):
-        """Apply a single event to internal state."""
-        mid = evt["mid"]
-        data = evt["data"]
-        ts = evt["ts"]
+    def _apply_event(self, evt: dict = None, *, ts: float = 0, mid: str = "", data: dict = None):
+        """Apply a single event to internal state.
+
+        Accepts either a dict (legacy) or keyword args (streaming, avoids dict alloc).
+        """
+        if evt is not None:
+            mid = evt["mid"]
+            data = evt["data"]
+            ts = evt["ts"]
+        if data is None:
+            return
 
         if mid not in self._markets:
             self._markets[mid] = SimMarket(market_id=mid, first_seen=ts)
@@ -267,11 +274,14 @@ class MarketSimulator:
         except (TypeError, ValueError):
             pass
 
-        # Record price history (sampled)
+        # Record price history (sampled, capped at 200 points per market)
         if book.best_bid > 0 and book.best_ask > 0:
             mid_p = (book.best_bid + book.best_ask) / 2
-            if market.update_count % 10 == 0:
+            if market.update_count % 50 == 0:  # Sample less frequently
                 market.price_history.append((ts, mid_p))
+                # Cap to prevent unbounded memory growth
+                if len(market.price_history) > 200:
+                    market.price_history = market.price_history[-200:]
 
     # ── PUBLIC API (what the trading bot sees) ────────────────────
 
@@ -686,48 +696,45 @@ def run_simulation(
     sim = MarketSimulator(speed=speed)
     bot = TradingBot(sim, capital=capital)
 
-    mode = f"REALTIME {speed}x" if speed > 0 else "FAST (real latency, no wait)"
     logger.info("=" * 70)
     logger.info("  SIMULATED LIVE ENVIRONMENT")
-    logger.info("  Files: %d | Capital: $%.0f | Mode: %s", len(parquet_paths), capital, mode)
+    logger.info("  Files: %d | Capital: $%.0f", len(parquet_paths), capital)
     logger.info("  Bot sees ONLY current market state (no future data)")
     logger.info("  Fills at ACTUAL book price at fill time (not eval time)")
-    logger.info("  Memory-safe: processes one file at a time")
+    logger.info("  STREAMING: never holds more than 1M events in memory")
     logger.info("=" * 70)
 
     t0 = time.time()
     total_events = 0
-    file_num = 0
 
-    for fpath in sorted(parquet_paths):
-        file_num += 1
-        logger.info("--- File %d/%d: %s ---", file_num, len(parquet_paths), Path(fpath).name)
+    # Memory monitoring
+    import psutil
+    process = psutil.Process()
 
-        # Load ONE file into the simulator (clears previous events, keeps market state)
-        n = sim.load([fpath], max_rows=max_rows)
-        if n == 0:
-            continue
+    def get_mem_mb():
+        return process.memory_info().rss / (1024 * 1024)
+
+    MEM_LIMIT_MB = 5500  # Stay under 5.5GB (GH Actions has 7GB)
+    logger.info("  Initial memory: %.0f MB", get_mem_mb())
+
+    # Bot callback — called by simulator every 20K events
+    def bot_scan(sim_ref):
+        bot.scan_and_trade()
+        mem = get_mem_mb()
+        sim_time = sim_ref.get_sim_time_str()
+        logger.info(
+            "  %s | %d markets | %d trades | $%.0f cash | %d open | %.0fMB RAM",
+            sim_time, sim_ref.total_markets, len(bot.trades),
+            bot.cash, len(bot.positions), mem,
+        )
+        if mem > MEM_LIMIT_MB:
+            logger.warning("  MEMORY WARNING: %.0f MB > %d MB limit!", mem, MEM_LIMIT_MB)
+
+    for i, fpath in enumerate(sorted(parquet_paths)):
+        logger.info("--- File %d/%d: %s ---", i + 1, len(parquet_paths), Path(fpath).name)
+        sim._started = True
+        n = sim.load_and_process_file(fpath, bot_callback=bot_scan)
         total_events += n
-
-        if not sim._started:
-            sim.start()
-
-        cycle = 0
-        while sim.tick():
-            cycle += 1
-
-            if cycle % (scan_interval_events // 5000) == 0:
-                bot.scan_and_trade()
-
-            if cycle % 50 == 0:
-                pct = sim.progress * 100
-                sim_time = sim.get_sim_time_str()
-                logger.info(
-                    "  [%.0f%%] %s | %d markets | %d trades | $%.0f cash | %d open",
-                    pct, sim_time, sim.total_markets, len(bot.trades),
-                    bot.cash, len(bot.positions),
-                )
-
         logger.info(
             "  File done: %d events | %d markets | %d trades",
             n, sim.total_markets, len(bot.trades),
