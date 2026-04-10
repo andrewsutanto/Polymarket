@@ -75,7 +75,7 @@ class BacktestResult:
     is_oos: bool = False    # True if out-of-sample
 
 
-# ─── Data Fetching ────────────────────────────────────────────────
+# --- Data Fetching ------------------------------------------------
 
 def fetch_all_resolved(limit: int = 500) -> list[dict]:
     """Fetch resolved markets from Gamma API with pagination."""
@@ -204,7 +204,7 @@ def fetch_price_history(token_id: str) -> list[float]:
     return []
 
 
-# ─── Kelly Sizing (no maker bonus) ─────────────────────────────
+# --- Kelly Sizing (no maker bonus) -----------------------------
 
 def kelly_size(edge: float, price: float, bankroll: float) -> float:
     if price <= 0.01 or price >= 0.99 or edge <= 0:
@@ -220,7 +220,7 @@ def kelly_size(edge: float, price: float, bankroll: float) -> float:
     return max(0.50, min(kelly * bankroll, bankroll * 0.10))  # Max 10% per trade
 
 
-# ─── Backtest Engine ──────────────────────────────────────────────
+# --- Backtest Engine ----------------------------------------------
 
 def run_strategy(
     markets: list[dict],
@@ -415,7 +415,7 @@ def bootstrap_ci(outcomes: list[int], n_boot: int = 5000, ci: float = 0.95) -> t
     )
 
 
-# ─── Main ─────────────────────────────────────────────────────────
+# --- Main ---------------------------------------------------------
 
 def main():
     import argparse
@@ -535,9 +535,9 @@ def main():
         )
 
     # Combinatorial arbitrage results
-    print(f"\n{'─' * 60}")
+    print(f"\n{'-' * 60}")
     print(f"  COMBINATORIAL ARBITRAGE SCAN")
-    print(f"{'─' * 60}")
+    print(f"{'-' * 60}")
     arb_stats = arb_engine.get_stats()
     print(f"  Clusters found: {arb_stats['total_clusters']}")
     print(f"  Mutex clusters: {arb_stats['mutex_clusters']}")
@@ -556,9 +556,9 @@ def main():
             print(f"    {opp.description[:70]}")
 
     # Category breakdown
-    print(f"\n{'─' * 60}")
+    print(f"\n{'-' * 60}")
     print(f"  CATEGORY BREAKDOWN")
-    print(f"{'─' * 60}")
+    print(f"{'-' * 60}")
     cats = {}
     for m in resolved:
         cat = m["category"]
