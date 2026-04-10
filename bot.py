@@ -35,6 +35,8 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import csv
+import io
 import json
 import logging
 import os
@@ -42,7 +44,7 @@ import sqlite3
 import sys
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import numpy as np
@@ -147,6 +149,11 @@ class BotState:
         self.scan_count = 0
         self.start_time = datetime.now(timezone.utc)
 
+        # Alerts
+        self.alerts_enabled = False
+        self.alerts_threshold = 5.0  # percent
+        self.price_snapshots: dict[str, float] = {}  # condition_id -> last price
+
         # Models
         self.markov = MarkovModel(n_states=10, n_simulations=5000)
         self.calibrator = BiasCalibrator()
@@ -243,46 +250,68 @@ def is_coinflip(q: str) -> bool:
            ("penta kill" in q) or ("odd/even" in q)
 
 
+async def fetch_with_backoff(
+    session: aiohttp.ClientSession,
+    url: str,
+    params: dict | None = None,
+    max_retries: int = 3,
+    timeout_s: float = 15,
+) -> dict | list | None:
+    """Fetch with exponential backoff on 429/5xx errors.
+
+    Addresses: rate limits, transient failures, API throttling.
+    """
+    for attempt in range(max_retries):
+        try:
+            async with session.get(
+                url, params=params,
+                timeout=aiohttp.ClientTimeout(total=timeout_s),
+            ) as resp:
+                if resp.status == 200:
+                    return await resp.json()
+                if resp.status == 429:
+                    wait = 2 ** attempt + 1
+                    logger.warning(f"Rate limited (429), waiting {wait}s...")
+                    await asyncio.sleep(wait)
+                    continue
+                if resp.status >= 500:
+                    await asyncio.sleep(1)
+                    continue
+                return None
+        except asyncio.TimeoutError:
+            logger.warning(f"Timeout on {url} (attempt {attempt+1})")
+            await asyncio.sleep(1)
+        except Exception as e:
+            logger.warning(f"Fetch error {url}: {e}")
+            return None
+    return None
+
+
 async def fetch_markets(session: aiohttp.ClientSession) -> list[dict]:
-    try:
-        async with session.get(
-            f"{GAMMA_API}/markets",
-            params={"active": "true", "closed": "false", "limit": 100,
-                    "order": "volume24hr", "ascending": "false"},
-            timeout=aiohttp.ClientTimeout(total=15)
-        ) as resp:
-            if resp.status == 200:
-                return await resp.json()
-    except Exception as e:
-        logger.warning(f"Gamma API: {e}")
-    return []
+    result = await fetch_with_backoff(
+        session, f"{GAMMA_API}/markets",
+        params={"active": "true", "closed": "false", "limit": 100,
+                "order": "volume24hr", "ascending": "false"},
+    )
+    return result if isinstance(result, list) else []
 
 
 async def fetch_book(session: aiohttp.ClientSession, token_id: str) -> dict:
-    try:
-        async with session.get(
-            f"{CLOB_API}/book", params={"token_id": token_id},
-            timeout=aiohttp.ClientTimeout(total=8)
-        ) as resp:
-            if resp.status == 200:
-                return await resp.json()
-    except Exception:
-        pass
-    return {}
+    result = await fetch_with_backoff(
+        session, f"{CLOB_API}/book",
+        params={"token_id": token_id}, timeout_s=8,
+    )
+    return result if isinstance(result, dict) else {}
 
 
 async def fetch_history(session: aiohttp.ClientSession, token_id: str) -> list[float]:
-    try:
-        async with session.get(
-            f"{CLOB_API}/prices-history",
-            params={"market": token_id, "interval": "max", "fidelity": "60"},
-            timeout=aiohttp.ClientTimeout(total=10)
-        ) as resp:
-            if resp.status == 200:
-                data = await resp.json()
-                return [h["p"] for h in data.get("history", [])]
-    except Exception:
-        pass
+    result = await fetch_with_backoff(
+        session, f"{CLOB_API}/prices-history",
+        params={"market": token_id, "interval": "max", "fidelity": "60"},
+        timeout_s=10,
+    )
+    if isinstance(result, dict):
+        return [h["p"] for h in result.get("history", [])]
     return []
 
 
@@ -426,12 +455,38 @@ def build_app(state: BotState, http_session_holder: list) -> Application:
         if not authorized(update):
             return
         dd = 0.0
+        eq = [state.starting_capital]
         if state.trades:
-            eq = [state.starting_capital]
             for t in state.trades:
                 eq.append(eq[-1] + t.pnl)
             peak = max(eq)
             dd = (peak - eq[-1]) / peak * 100 if peak > 0 else 0
+
+        # Mini equity sparkline
+        equity_spark = ""
+        if len(eq) > 1:
+            blocks = "\u2581\u2582\u2583\u2584\u2585\u2586\u2587\u2588"
+            mn, mx = min(eq[-20:]), max(eq[-20:])
+            rng = mx - mn
+            for v in eq[-20:]:
+                idx = int((v - mn) / rng * (len(blocks) - 1)) if rng > 0 else 3
+                equity_spark += blocks[idx]
+            equity_spark = f"<code>{equity_spark}</code>"
+
+        # Position distribution bar chart
+        pos_chart = ""
+        if state.positions:
+            cats: dict[str, float] = {}
+            for p in state.positions.values():
+                cats[p.category] = cats.get(p.category, 0) + p.size_usd
+            total_pos_val = sum(cats.values()) or 1
+            lines = []
+            for cat, val in sorted(cats.items(), key=lambda x: -x[1]):
+                pct = val / total_pos_val * 100
+                filled = int(pct / 100 * 12)
+                bar = "\u2588" * filled + "\u2591" * (12 - filled)
+                lines.append(f"  {cat:<8} {bar} ${val:.2f}")
+            pos_chart = "\n<b>Position Distribution:</b>\n" + "\n".join(lines)
 
         text = (
             "<b>Portfolio Status</b>\n\n"
@@ -449,6 +504,11 @@ def build_app(state: BotState, http_session_holder: list) -> Application:
             f"Uptime:     {state.uptime}\n"
             f"Kill Switch: {'ON' if state.kill_switch else 'OFF'}"
         )
+        if equity_spark:
+            text += f"\n\n<b>Equity Curve:</b>\n{equity_spark}"
+        if pos_chart:
+            text += f"\n{pos_chart}"
+
         await update.message.reply_text(text, parse_mode="HTML")
 
     # ── /positions ──
@@ -741,6 +801,282 @@ def build_app(state: BotState, http_session_holder: list) -> Application:
         )
         await update.message.reply_text(text, parse_mode="HTML")
 
+    # ── /backtest ──
+    async def cmd_backtest(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        if not authorized(update):
+            return
+        n_markets = 50
+        if ctx.args and ctx.args[0].isdigit():
+            n_markets = int(ctx.args[0])
+        n_markets = max(5, min(n_markets, 500))
+
+        await update.message.reply_text(
+            f"Running mini-backtest on last {n_markets} resolved markets..."
+        )
+
+        async def _run_backtest():
+            try:
+                rows = state.db.execute(
+                    "SELECT entry_price, exit_price, size_usd, edge, pnl "
+                    "FROM trades ORDER BY id DESC LIMIT ?",
+                    (n_markets,),
+                ).fetchall()
+
+                if not rows:
+                    return "No historical trades found for backtest."
+
+                pnls = [r[4] for r in rows]
+                sizes = [r[2] for r in rows]
+                edges = [r[3] for r in rows]
+                wins = sum(1 for p in pnls if p > 0)
+                total_pnl = sum(pnls)
+                wr = wins / len(pnls) * 100
+
+                # Sharpe ratio (annualized, assuming ~3 trades/day)
+                if len(pnls) > 1:
+                    returns = [p / max(s, 0.01) for p, s in zip(pnls, sizes)]
+                    avg_r = np.mean(returns)
+                    std_r = np.std(returns)
+                    sharpe = (avg_r / std_r * np.sqrt(365 * 3)) if std_r > 0 else 0.0
+                else:
+                    sharpe = 0.0
+
+                # Max drawdown
+                equity = [state.starting_capital]
+                for p in reversed(pnls):
+                    equity.append(equity[-1] + p)
+                peak = equity[0]
+                max_dd = 0.0
+                for e in equity:
+                    peak = max(peak, e)
+                    dd = (peak - e) / peak * 100 if peak > 0 else 0
+                    max_dd = max(max_dd, dd)
+
+                avg_edge = np.mean(edges) * 100
+                avg_size = np.mean(sizes)
+
+                # Equity sparkline
+                sparkline = _text_sparkline(equity[-20:]) if len(equity) > 1 else ""
+
+                text = (
+                    f"<b>Mini-Backtest Results</b>\n"
+                    f"Trades: {len(pnls)}\n\n"
+                    f"{sparkline}\n\n"
+                    f"Win Rate:    <b>{wr:.1f}%</b>\n"
+                    f"Total P&L:   <b>${total_pnl:+.2f}</b>\n"
+                    f"Sharpe:      <b>{sharpe:.2f}</b>\n"
+                    f"Max DD:      {max_dd:.1f}%\n"
+                    f"Avg Edge:    {avg_edge:.2f}%\n"
+                    f"Avg Size:    ${avg_size:.2f}\n"
+                )
+                return text
+            except Exception as e:
+                return f"Backtest error: {e}"
+
+        result = await _run_backtest()
+        await update.message.reply_text(result, parse_mode="HTML")
+
+    # ── /alerts ──
+    async def cmd_alerts(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        if not authorized(update):
+            return
+        args = ctx.args
+
+        if not args:
+            status = "ON" if state.alerts_enabled else "OFF"
+            text = (
+                f"<b>Alert Settings</b>\n\n"
+                f"Status:    <b>{status}</b>\n"
+                f"Threshold: <b>{state.alerts_threshold:.1f}%</b>\n"
+                f"Tracked:   {len(state.price_snapshots)} markets\n\n"
+                f"Usage:\n"
+                f"  /alerts on — Enable alerts\n"
+                f"  /alerts off — Disable alerts\n"
+                f"  /alerts threshold 5 — Set % threshold"
+            )
+            await update.message.reply_text(text, parse_mode="HTML")
+            return
+
+        subcmd = args[0].lower()
+        if subcmd == "on":
+            state.alerts_enabled = True
+            # Snapshot current prices
+            for cid, m in state.markets.items():
+                if m.mid_price > 0:
+                    state.price_snapshots[cid] = m.mid_price
+            await update.message.reply_text(
+                f"Alerts <b>enabled</b>. Tracking {len(state.price_snapshots)} markets "
+                f"with {state.alerts_threshold:.1f}% threshold.",
+                parse_mode="HTML",
+            )
+        elif subcmd == "off":
+            state.alerts_enabled = False
+            await update.message.reply_text("Alerts <b>disabled</b>.", parse_mode="HTML")
+        elif subcmd == "threshold" and len(args) > 1:
+            try:
+                val = float(args[1])
+                state.alerts_threshold = max(0.5, min(val, 50.0))
+                await update.message.reply_text(
+                    f"Alert threshold set to <b>{state.alerts_threshold:.1f}%</b>.",
+                    parse_mode="HTML",
+                )
+            except ValueError:
+                await update.message.reply_text("Usage: /alerts threshold 5")
+        else:
+            await update.message.reply_text(
+                "Usage: /alerts [on|off|threshold <pct>]"
+            )
+
+    # ── /performance ──
+    async def cmd_performance(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        if not authorized(update):
+            return
+        if not state.trades:
+            await update.message.reply_text("No trades yet for performance analysis.")
+            return
+
+        # Equity curve
+        equity = [state.starting_capital]
+        for t in state.trades:
+            equity.append(equity[-1] + t.pnl)
+        sparkline = _text_sparkline(equity[-30:])
+
+        # Win rate by category
+        cats: dict[str, dict] = {}
+        for t in state.trades:
+            if t.category not in cats:
+                cats[t.category] = {"n": 0, "w": 0, "pnl": 0.0}
+            cats[t.category]["n"] += 1
+            cats[t.category]["pnl"] += t.pnl
+            if t.pnl > 0:
+                cats[t.category]["w"] += 1
+
+        cat_lines = []
+        for cat, s in sorted(cats.items(), key=lambda x: -x[1]["pnl"]):
+            wr = s["w"] / s["n"] * 100 if s["n"] > 0 else 0
+            bar = _bar_char(wr, 100, width=8)
+            cat_lines.append(f"  {cat:<10} {bar} {wr:.0f}% ({s['n']}t, ${s['pnl']:+.2f})")
+
+        # Best / worst trades
+        sorted_by_pnl = sorted(state.trades, key=lambda t: t.pnl)
+        worst = sorted_by_pnl[:3]
+        best = sorted_by_pnl[-3:][::-1]
+
+        best_lines = []
+        for t in best:
+            best_lines.append(f"  ${t.pnl:+.2f} — {t.question[:35]}")
+        worst_lines = []
+        for t in worst:
+            worst_lines.append(f"  ${t.pnl:+.2f} — {t.question[:35]}")
+
+        # Rolling 7-day Sharpe
+        now = datetime.now(timezone.utc)
+        week_ago = now - timedelta(days=7)
+        recent = []
+        for t in state.trades:
+            try:
+                ts = datetime.fromisoformat(t.timestamp)
+                if ts >= week_ago:
+                    ret = t.pnl / max(t.size_usd, 0.01)
+                    recent.append(ret)
+            except Exception:
+                pass
+
+        if len(recent) > 1:
+            avg_r = np.mean(recent)
+            std_r = np.std(recent)
+            sharpe_7d = (avg_r / std_r * np.sqrt(365 * 3)) if std_r > 0 else 0.0
+        elif len(recent) == 1:
+            sharpe_7d = 0.0
+        else:
+            sharpe_7d = 0.0
+
+        text = (
+            f"<b>Performance Analytics</b>\n\n"
+            f"<b>Equity Curve (last 30):</b>\n"
+            f"<code>{sparkline}</code>\n\n"
+            f"<b>Win Rate by Category:</b>\n"
+            + "\n".join(cat_lines) + "\n\n"
+            f"<b>Best Trades:</b>\n"
+            + "\n".join(best_lines) + "\n\n"
+            f"<b>Worst Trades:</b>\n"
+            + "\n".join(worst_lines) + "\n\n"
+            f"<b>7-Day Rolling Sharpe:</b> {sharpe_7d:.2f}\n"
+            f"<b>7-Day Trades:</b> {len(recent)}"
+        )
+        await update.message.reply_text(text, parse_mode="HTML")
+
+    # ── /export ──
+    async def cmd_export(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        if not authorized(update):
+            return
+        if not state.trades:
+            await update.message.reply_text("No trades to export.")
+            return
+
+        fmt = "csv"
+        if ctx.args and ctx.args[0].lower() in ("csv", "json"):
+            fmt = ctx.args[0].lower()
+
+        trades_data = []
+        for t in state.trades:
+            trades_data.append({
+                "timestamp": t.timestamp,
+                "market_id": t.market_id,
+                "question": t.question,
+                "category": t.category,
+                "direction": t.direction,
+                "entry_price": t.entry_price,
+                "exit_price": t.exit_price,
+                "size_usd": t.size_usd,
+                "edge": t.edge,
+                "pnl": t.pnl,
+                "mode": t.mode,
+            })
+
+        if fmt == "json":
+            content = json.dumps(trades_data, indent=2)
+            filename = "trades_export.json"
+        else:
+            buf = io.StringIO()
+            if trades_data:
+                writer = csv.DictWriter(buf, fieldnames=trades_data[0].keys())
+                writer.writeheader()
+                writer.writerows(trades_data)
+            content = buf.getvalue()
+            filename = "trades_export.csv"
+
+        # Send as file attachment
+        file_bytes = io.BytesIO(content.encode("utf-8"))
+        file_bytes.name = filename
+        await update.message.reply_document(
+            document=file_bytes,
+            filename=filename,
+            caption=f"Exported {len(trades_data)} trades as {fmt.upper()}.",
+        )
+
+    # ── Helper: Text sparkline ──
+    def _text_sparkline(values: list[float]) -> str:
+        """Generate a Unicode sparkline from a list of values."""
+        if not values or len(values) < 2:
+            return ""
+        blocks = " _.,:-=!#"
+        mn, mx = min(values), max(values)
+        rng = mx - mn
+        if rng == 0:
+            return blocks[4] * len(values)
+        result = ""
+        for v in values:
+            idx = int((v - mn) / rng * (len(blocks) - 1))
+            result += blocks[idx]
+        return result
+
+    # ── Helper: Bar character ──
+    def _bar_char(value: float, max_val: float, width: int = 10) -> str:
+        """Generate a Unicode bar chart segment."""
+        filled = int(value / max(max_val, 0.01) * width)
+        return "\u2588" * filled + "\u2591" * (width - filled)
+
     # ── /help ──
     async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if not authorized(update):
@@ -762,6 +1098,10 @@ def build_app(state: BotState, http_session_holder: list) -> Application:
             "/resume — Resume trading\n"
             "/stats — Alpha combiner stats\n"
             "/risk — Risk rules &amp; status\n"
+            "/backtest &lt;n&gt; — Mini-backtest on last n trades\n"
+            "/alerts — Configure price alerts\n"
+            "/performance — Rich analytics &amp; sparklines\n"
+            "/export &lt;csv|json&gt; — Export trade history\n"
             "/help — This message"
         )
         await update.message.reply_text(text, parse_mode="HTML")
@@ -802,6 +1142,10 @@ def build_app(state: BotState, http_session_holder: list) -> Application:
     app.add_handler(CommandHandler("stats", cmd_stats))
     app.add_handler(CommandHandler("arb", cmd_arb))
     app.add_handler(CommandHandler("risk", cmd_risk))
+    app.add_handler(CommandHandler("backtest", cmd_backtest))
+    app.add_handler(CommandHandler("alerts", cmd_alerts))
+    app.add_handler(CommandHandler("performance", cmd_performance))
+    app.add_handler(CommandHandler("export", cmd_export))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CallbackQueryHandler(handle_callback))
 
@@ -903,13 +1247,40 @@ async def run_scan(session: aiohttp.ClientSession, state: BotState) -> list[dict
                 m.price_history.append(m.mid_price)
         await asyncio.sleep(0.1)
 
-    # 4. Check shadow fills on existing positions
+    # 4. Check shadow fills + expire stale unfilled orders
+    ORDER_TIMEOUT_S = 600  # Cancel unfilled limit orders after 10 minutes
+    now = datetime.now(timezone.utc)
+
     for tid, pos in list(state.positions.items()):
         m = state.markets.get(pos.market_id)
+
+        # Expire unfilled orders that are too old
+        if not pos.filled and pos.opened_at:
+            try:
+                opened = datetime.fromisoformat(pos.opened_at)
+                age_s = (now - opened).total_seconds()
+                if age_s > ORDER_TIMEOUT_S:
+                    logger.info(
+                        f"ORDER EXPIRED ({age_s:.0f}s): {pos.direction} {pos.question[:40]}"
+                    )
+                    state.cash += pos.size_usd  # Return reserved capital
+                    del state.positions[tid]
+                    continue
+            except (ValueError, TypeError):
+                pass
+
+        # Check shadow fill (did price cross our limit?)
         if m and not pos.filled and check_shadow_fill(pos, m):
             pos.filled = True
-            pos.fill_time = datetime.now(timezone.utc).isoformat()
+            pos.fill_time = now.isoformat()
             logger.info(f"Shadow fill: {pos.direction} {pos.question[:40]}")
+
+        # Staleness check: if book hasn't updated, don't trust the fill
+        if m and pos.filled and m.spread > 0.10:
+            logger.warning(
+                f"Wide spread ({m.spread:.2f}) on filled position {pos.question[:30]} "
+                f"- book may be stale"
+            )
 
         # Check for resolution (price at 0 or 1)
         if m and (m.mid_price >= 0.98 or m.mid_price <= 0.02):
@@ -1027,6 +1398,34 @@ async def main():
                                     f"Size: ${sig['size']:.2f} | "
                                     f"Cat: {m.category}"
                                 ),
+                                parse_mode="HTML",
+                            )
+
+                    # Check price movement alerts
+                    if state.alerts_enabled and chat_id:
+                        alert_lines = []
+                        for cid, m in state.markets.items():
+                            if m.mid_price <= 0:
+                                continue
+                            old_price = state.price_snapshots.get(cid)
+                            if old_price is not None and old_price > 0:
+                                move_pct = abs(m.mid_price - old_price) / old_price * 100
+                                if move_pct >= state.alerts_threshold:
+                                    direction = "\u2b06" if m.mid_price > old_price else "\u2b07"
+                                    alert_lines.append(
+                                        f"{direction} <b>{m.question[:45]}</b>\n"
+                                        f"  {old_price:.3f} -> {m.mid_price:.3f} ({move_pct:+.1f}%)"
+                                    )
+                            state.price_snapshots[cid] = m.mid_price
+
+                        if alert_lines:
+                            alert_text = (
+                                f"<b>Price Alert ({state.alerts_threshold:.1f}% threshold)</b>\n\n"
+                                + "\n".join(alert_lines[:10])
+                            )
+                            await app.bot.send_message(
+                                chat_id=chat_id,
+                                text=alert_text,
                                 parse_mode="HTML",
                             )
                 except Exception as e:
