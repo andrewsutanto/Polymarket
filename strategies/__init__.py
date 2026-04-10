@@ -13,6 +13,8 @@ from strategies.stale_market import StaleMarketStrategy
 from strategies.line_movement import LineMovementStrategy
 from strategies.mean_reversion import MeanReversionStrategy
 from strategies.ensemble import EnsembleStrategy
+from strategies.orderbook_imbalance import OrderbookImbalanceStrategy
+from strategies.temporal_bias import TemporalBiasStrategy
 
 ALL_STRATEGIES = {
     "implied_prob_arb": ImpliedProbArbStrategy,
@@ -21,6 +23,8 @@ ALL_STRATEGIES = {
     "stale_market": StaleMarketStrategy,
     "line_movement": LineMovementStrategy,
     "mean_reversion": MeanReversionStrategy,
+    "orderbook_imbalance": OrderbookImbalanceStrategy,
+    "temporal_bias": TemporalBiasStrategy,
 }
 
 __all__ = [
@@ -33,5 +37,7 @@ __all__ = [
     "LineMovementStrategy",
     "MeanReversionStrategy",
     "EnsembleStrategy",
+    "OrderbookImbalanceStrategy",
+    "TemporalBiasStrategy",
     "ALL_STRATEGIES",
 ]

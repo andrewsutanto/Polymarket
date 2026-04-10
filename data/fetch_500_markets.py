@@ -854,6 +854,125 @@ def build_price_series_from_trades(
 
 
 # ────────────────────────────────────────────────────────────
+# Lightweight: Build prices from CLOB API (no large download)
+# ────────────────────────────────────────────────────────────
+
+CLOB_BASE = "https://clob.polymarket.com"
+
+
+def build_price_series_from_clob(
+    conn: sqlite3.Connection,
+    max_markets: int = 600,
+    sleep_between: float = 0.35,
+) -> dict[str, int]:
+    """Fetch CLOB price histories for markets that have tokens but no prices.
+
+    This is the lightweight alternative that avoids the 36GB download.
+    It calls the CLOB API per-market, so it's slower but requires no
+    large file downloads.
+    """
+    import requests
+
+    cursor = conn.execute("""
+        SELECT m.condition_id, m.tokens
+        FROM markets m
+        LEFT JOIN (
+            SELECT condition_id, COUNT(*) as cnt
+            FROM price_history
+            GROUP BY condition_id
+        ) ph ON m.condition_id = ph.condition_id
+        WHERE m.tokens != '[]' AND m.tokens != ''
+          AND m.resolution IN ('resolved', 'closed')
+          AND (ph.cnt IS NULL OR ph.cnt < 10)
+        ORDER BY m.volume DESC
+        LIMIT ?
+    """, (max_markets,))
+
+    rows = cursor.fetchall()
+    logger.info("CLOB price fetch: %d markets to process", len(rows))
+
+    stats = {
+        "attempted": 0, "success": 0, "empty": 0,
+        "error": 0, "total_points": 0,
+    }
+
+    for i, (cid, tokens_json) in enumerate(rows):
+        try:
+            tokens = json.loads(tokens_json) if isinstance(tokens_json, str) else tokens_json
+        except (json.JSONDecodeError, TypeError):
+            continue
+
+        if not isinstance(tokens, list) or not tokens:
+            continue
+
+        token_id = tokens[0]
+        if isinstance(token_id, dict):
+            token_id = token_id.get("token_id", "")
+        if not token_id or not isinstance(token_id, str):
+            continue
+
+        stats["attempted"] += 1
+
+        try:
+            resp = requests.get(
+                f"{CLOB_BASE}/prices-history",
+                params={"market": token_id},
+                timeout=30,
+                headers={"User-Agent": "polymarket-backtester/1.0 (research)"},
+            )
+
+            if resp.status_code == 429:
+                logger.warning("CLOB rate limited, sleeping 15s...")
+                time.sleep(15)
+                stats["attempted"] -= 1
+                continue
+
+            resp.raise_for_status()
+            data = resp.json()
+            history = data.get("history", [])
+
+            if history:
+                pts = 0
+                for point in history:
+                    try:
+                        conn.execute(
+                            """INSERT OR IGNORE INTO price_history
+                               (condition_id, token_id, timestamp, price, source)
+                               VALUES (?, ?, ?, ?, 'clob')""",
+                            (cid, token_id,
+                             int(point.get("t", 0)),
+                             float(point.get("p", 0))),
+                        )
+                        pts += 1
+                    except Exception:
+                        pass
+                conn.commit()
+                stats["success"] += 1
+                stats["total_points"] += pts
+            else:
+                stats["empty"] += 1
+
+        except requests.RequestException:
+            stats["error"] += 1
+
+        time.sleep(sleep_between)
+
+        if (i + 1) % 50 == 0:
+            logger.info(
+                "  CLOB progress: %d/%d (success=%d, empty=%d, points=%d)",
+                i + 1, len(rows), stats["success"],
+                stats["empty"], stats["total_points"],
+            )
+
+    logger.info(
+        "CLOB fetch complete: %d attempted, %d success, %d empty, %d errors, %d points",
+        stats["attempted"], stats["success"], stats["empty"],
+        stats["error"], stats["total_points"],
+    )
+    return stats
+
+
+# ────────────────────────────────────────────────────────────
 # Status and reporting
 # ────────────────────────────────────────────────────────────
 
@@ -982,12 +1101,13 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  python data/fetch_500_markets.py                     # Full pipeline
+  python data/fetch_500_markets.py                     # Full pipeline (CLOB API prices)
   python data/fetch_500_markets.py --metadata-only     # Just market metadata (fast)
   python data/fetch_500_markets.py --prices-only       # Build prices for existing markets
   python data/fetch_500_markets.py --status            # Check database status
   python data/fetch_500_markets.py --target 1000       # Get 1000 markets
-  python data/fetch_500_markets.py --use-trades        # Use trades.parquet instead of quant
+  python data/fetch_500_markets.py --use-hf-quant      # Use quant.parquet (36GB download)
+  python data/fetch_500_markets.py --use-hf-trades     # Use trades.parquet (28GB download)
         """,
     )
     parser.add_argument("--target", type=int, default=600,
@@ -998,8 +1118,10 @@ Examples:
                         help="Only fetch market metadata, skip price histories")
     parser.add_argument("--prices-only", action="store_true",
                         help="Only build prices for markets already in DB")
-    parser.add_argument("--use-trades", action="store_true",
-                        help="Use trades.parquet instead of quant.parquet for prices")
+    parser.add_argument("--use-hf-quant", action="store_true",
+                        help="Use HF quant.parquet for prices (36GB download)")
+    parser.add_argument("--use-hf-trades", action="store_true",
+                        help="Use HF trades.parquet for prices (28GB download)")
     parser.add_argument("--status", action="store_true",
                         help="Print database status and exit")
     parser.add_argument("--db", type=str, default=str(DB_PATH),
@@ -1048,27 +1170,43 @@ Examples:
     # Step 2: Price histories
     if not args.metadata_only:
         logger.info("=" * 60)
-        logger.info("STEP 2: Building price histories from HuggingFace trades")
+        logger.info("STEP 2: Building price histories")
         logger.info("=" * 60)
 
-        target_cids = _get_markets_needing_prices(conn, limit=args.target)
-        logger.info("Markets needing prices: %d", len(target_cids))
+        if args.use_hf_quant:
+            # Option A: Download full quant.parquet from HuggingFace (36GB)
+            target_cids = _get_markets_needing_prices(conn, limit=args.target)
+            logger.info("Markets needing prices: %d", len(target_cids))
+            if target_cids:
+                logger.info("Using quant.parquet (36GB, unified YES perspective)")
+                price_stats = build_price_series_from_quant(
+                    conn, target_cids, cache_dir,
+                )
+                logger.info("Price build stats: %s", price_stats)
 
-        if target_cids:
-            if args.use_trades:
+        elif args.use_hf_trades:
+            # Option B: Download trades.parquet from HuggingFace (28GB)
+            target_cids = _get_markets_needing_prices(conn, limit=args.target)
+            logger.info("Markets needing prices: %d", len(target_cids))
+            if target_cids:
                 logger.info("Using trades.parquet (28GB)")
                 price_stats = build_price_series_from_trades(
                     conn, target_cids, cache_dir,
                 )
-            else:
-                logger.info("Using quant.parquet (28GB, unified YES perspective)")
-                price_stats = build_price_series_from_quant(
-                    conn, target_cids, cache_dir,
-                )
+                logger.info("Price build stats: %s", price_stats)
 
-            logger.info("Price build stats: %s", price_stats)
         else:
-            logger.info("All markets already have price data!")
+            # Default: Use CLOB API (lightweight, no large downloads)
+            logger.info(
+                "Using CLOB API for price histories (lightweight, ~3-5 min for 600 markets)"
+            )
+            logger.info(
+                "For full HF data instead, use --use-hf-quant (36GB) or --use-hf-trades (28GB)"
+            )
+            price_stats = build_price_series_from_clob(
+                conn, max_markets=args.target,
+            )
+            logger.info("Price build stats: %s", price_stats)
     else:
         logger.info("Skipping price histories (--metadata-only)")
 
