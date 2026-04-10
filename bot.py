@@ -67,6 +67,7 @@ except ImportError:
 from core.markov_model import MarkovModel
 from core.bias_calibrator import BiasCalibrator
 from core.alpha_combiner import AlphaCombiner
+from core.state_manager import StateManager
 
 logging.basicConfig(
     level=logging.INFO,
@@ -167,6 +168,53 @@ class BotState:
 
         # DB
         self.db = self._init_db()
+
+        # Persistent state manager (crash recovery)
+        self.state_mgr = StateManager(db_path="data/bot_state.db")
+        self._recover_from_crash()
+
+    def _recover_from_crash(self) -> None:
+        """Recover portfolio state from SQLite after crash/restart."""
+        try:
+            cash, positions, trades = self.state_mgr.load_state()
+            if cash is not None:
+                self.cash = cash
+                for tid, pos_data in positions.items():
+                    self.positions[tid] = PaperPosition(
+                        token_id=pos_data.get("token_id", tid),
+                        market_id=pos_data.get("market_id", ""),
+                        question=pos_data.get("question", ""),
+                        category=pos_data.get("category", ""),
+                        direction=pos_data.get("direction", "BUY"),
+                        entry_price=pos_data.get("entry_price", 0.0),
+                        size_usd=pos_data.get("size_usd", 0.0),
+                        edge_at_entry=pos_data.get("edge_at_entry", 0.0),
+                        limit_price=pos_data.get("limit_price", 0.0),
+                        filled=pos_data.get("filled", False),
+                        fill_time=pos_data.get("fill_time", ""),
+                        opened_at=pos_data.get("opened_at", ""),
+                    )
+                logger.info(
+                    "Crash recovery: $%.2f cash, %d positions",
+                    self.cash, len(self.positions),
+                )
+        except Exception as e:
+            logger.warning("No prior state to recover: %s", e)
+
+    def persist_state(self) -> None:
+        """Persist current portfolio state to SQLite (call after every trade)."""
+        positions_data = {
+            tid: {
+                "token_id": p.token_id, "market_id": p.market_id,
+                "question": p.question, "category": p.category,
+                "direction": p.direction, "entry_price": p.entry_price,
+                "size_usd": p.size_usd, "edge_at_entry": p.edge_at_entry,
+                "limit_price": p.limit_price, "filled": p.filled,
+                "opened_at": p.opened_at,
+            }
+            for tid, p in self.positions.items()
+        }
+        self.state_mgr.save_state(self.cash, positions_data, [])
 
     @property
     def total_value(self) -> float:
