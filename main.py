@@ -1,7 +1,15 @@
+# DEPRECATED: Use bot.py instead. This file is kept for reference only.
+# All functionality has been consolidated into bot.py.
+
 """Entrypoint and async orchestrator for the Polymarket arbitrage scanner.
 
 Scans the full Polymarket universe for mispricing opportunities across
 all market categories. Telegram is the sole UI.
+
+DEPRECATED: This modular orchestrator (MarketScanner, GammaFeed, CLOBFeed,
+strategy registry) has been superseded by bot.py, which integrates the same
+scanning and trading logic with a full Telegram UI, risk management, order
+book walking, and crash recovery. Use ``python bot.py --mode paper`` instead.
 """
 
 from __future__ import annotations

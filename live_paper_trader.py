@@ -1,8 +1,14 @@
+# DEPRECATED: Use bot.py instead. This file is kept for reference only.
+# All functionality has been consolidated into bot.py.
+
 #!/usr/bin/env python3
 """Live Paper Trader — real-time Polymarket trading simulation.
 
 Connects to live Polymarket APIs (Gamma + CLOB), runs the Markov model
 in real-time, and simulates trades with realistic latency and fill modeling.
+
+DEPRECATED: The walk_book() VWAP fill simulation and risk rules from this
+file have been ported into bot.py. Use ``python bot.py --mode paper`` instead.
 
 No real money is risked. All trades are logged to SQLite for analysis.
 

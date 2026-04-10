@@ -68,6 +68,9 @@ from core.markov_model import MarkovModel
 from core.bias_calibrator import BiasCalibrator
 from core.alpha_combiner import AlphaCombiner
 from core.state_manager import StateManager
+from core.bayesian_updater import BayesianUpdater
+from core.smart_money import SmartMoneyDetector
+from core.ws_feed import WSFeed
 
 logging.basicConfig(
     level=logging.INFO,
@@ -78,6 +81,114 @@ logger = logging.getLogger(__name__)
 
 GAMMA_API = "https://gamma-api.polymarket.com"
 CLOB_API = "https://clob.polymarket.com"
+
+
+# ─── Order Book Walking (realistic fills) ────────────────────────
+
+def walk_book(
+    levels: list[dict],
+    size_usd: float,
+    side: str = "buy",
+) -> tuple[float, float]:
+    """Simulate filling an order by walking the order book.
+
+    Instead of using mid-price + flat slippage, this walks through
+    actual order book levels to compute a realistic VWAP fill price.
+
+    Ported from live_paper_trader.py for realistic paper-trade fills.
+
+    Args:
+        levels: List of {"price": str, "size": str} from CLOB API.
+               For buy orders, use asks (ascending price).
+               For sell orders, use bids (descending price).
+        size_usd: Dollar amount to fill.
+        side: "buy" or "sell".
+
+    Returns:
+        (vwap_fill_price, filled_usd) — may be partially filled.
+    """
+    if not levels:
+        return 0.0, 0.0
+
+    total_cost = 0.0
+    total_shares = 0.0
+    remaining_usd = size_usd
+
+    for level in levels:
+        price = float(level.get("price", 0))
+        size = float(level.get("size", 0))
+        if price <= 0 or size <= 0:
+            continue
+
+        level_usd = price * size  # total USD at this level
+        take_usd = min(remaining_usd, level_usd)
+        take_shares = take_usd / price
+
+        total_cost += take_usd
+        total_shares += take_shares
+        remaining_usd -= take_usd
+
+        if remaining_usd <= 0.001:
+            break
+
+    if total_shares <= 0:
+        return 0.0, 0.0
+
+    vwap = total_cost / total_shares
+    return round(vwap, 6), round(total_cost, 4)
+
+
+# ─── Risk Rules (ported from live_paper_trader.py) ───────────────
+
+MAX_POSITION_PCT = 0.10        # Max 10% of portfolio per trade
+MAX_DRAWDOWN_PCT = 0.30        # Stop trading at 30% drawdown
+MAX_CONCURRENT_POSITIONS = 5   # Max 5 open positions
+DAILY_LOSS_LIMIT_PCT = 0.05   # 5% daily loss limit
+HIGH_CONVICTION_EDGE = 0.06   # Min edge when cash is low
+HIGH_CONVICTION_CASH_PCT = 0.30  # "Low cash" threshold
+
+
+def check_risk(
+    size_usd: float,
+    edge: float,
+    cash: float,
+    total_value: float,
+    starting_capital: float,
+    peak_value: float,
+    n_positions: int,
+    daily_start_value: float,
+) -> tuple[bool, str]:
+    """Validate trade against risk rules. Returns (allowed, reason).
+
+    Ported from live_paper_trader.py Portfolio.check_risk().
+    """
+    # Max drawdown kill switch
+    if peak_value > 0:
+        dd = (peak_value - total_value) / peak_value
+        if dd >= MAX_DRAWDOWN_PCT:
+            return False, f"drawdown {dd:.1%} >= {MAX_DRAWDOWN_PCT:.0%} limit"
+
+    # Max concurrent positions
+    if n_positions >= MAX_CONCURRENT_POSITIONS:
+        return False, f"max {MAX_CONCURRENT_POSITIONS} concurrent positions"
+
+    # Daily loss limit
+    if daily_start_value > 0:
+        daily_loss = (daily_start_value - total_value) / daily_start_value
+        if daily_loss >= DAILY_LOSS_LIMIT_PCT:
+            return False, f"daily loss {daily_loss:.1%} >= {DAILY_LOSS_LIMIT_PCT:.0%} limit"
+
+    # Max position size (% of portfolio)
+    max_size = total_value * MAX_POSITION_PCT
+    if size_usd > max_size:
+        return False, f"size ${size_usd:.2f} > {MAX_POSITION_PCT:.0%} of portfolio (${max_size:.2f})"
+
+    # High-conviction only mode (when cash is low)
+    cash_ratio = cash / max(starting_capital, 0.01)
+    if cash_ratio < HIGH_CONVICTION_CASH_PCT and edge < HIGH_CONVICTION_EDGE:
+        return False, f"cash {cash_ratio:.0%} < {HIGH_CONVICTION_CASH_PCT:.0%}, need edge > 6%"
+
+    return True, "ok"
 
 
 # ─── Data Models ───────────────────────────────────────────────────
@@ -154,6 +265,10 @@ class BotState:
         self.scan_count = 0
         self.start_time = datetime.now(timezone.utc)
 
+        # Risk tracking (ported from live_paper_trader.py)
+        self.peak_value = capital
+        self.daily_start_value = capital
+
         # Alerts
         self.alerts_enabled = False
         self.alerts_threshold = 5.0  # percent
@@ -165,6 +280,23 @@ class BotState:
         self.combiner = AlphaCombiner(min_trades_for_ic=10)
         for name in ["markov_mc", "markov_absorb", "no_bias", "maker_edge"]:
             self.combiner.register_strategy(name)
+
+        # Bayesian weight updater — learns from resolved trades
+        self.bayesian_updater = BayesianUpdater(
+            prior_alpha=1.0, prior_beta=1.0,
+            ic_window=100, min_observations=10,
+        )
+        for name in ["markov_mc", "markov_absorb", "no_bias", "maker_edge"]:
+            self.bayesian_updater.register_strategy(name)
+
+        # Smart money detector — track large institutional orders
+        self.smart_money = SmartMoneyDetector(
+            large_order_threshold_usd=1000.0,
+            flow_window_s=3600.0,
+        )
+
+        # WSFeed instance (started only when --ws flag is used)
+        self.ws_feed: WSFeed | None = None
 
         # DB
         self.db = self._init_db()
@@ -382,8 +514,20 @@ def kelly_size(edge: float, price: float, bankroll: float) -> float:
     return max(0.50, min(kelly * bankroll, 5.0))
 
 
-def evaluate_market(market: Market, state: BotState) -> dict | None:
-    """Evaluate a market and return signal dict or None."""
+def evaluate_market(
+    market: Market,
+    state: BotState,
+    smart_money_signal: dict | None = None,
+) -> dict | None:
+    """Evaluate a market and return signal dict or None.
+
+    Args:
+        market: Market data to evaluate.
+        state: Current bot state.
+        smart_money_signal: Optional smart money signal from SmartMoneyDetector.
+            When present and agrees with direction, boosts edge.
+            When present and disagrees, vetoes the trade.
+    """
     if is_coinflip(market.question):
         return None
     if len(market.price_history) < 15:
@@ -419,6 +563,23 @@ def evaluate_market(market: Market, state: BotState) -> dict | None:
     else:
         return None
 
+    # --- Smart money confirmation / veto ---
+    sm_confirms = False
+    if smart_money_signal:
+        sm_dir = smart_money_signal["direction"]
+        sm_edge = smart_money_signal.get("edge", 0)
+        sm_strength = smart_money_signal.get("strength", 0)
+        if sm_dir == direction:
+            # Smart money agrees — boost edge proportionally
+            total_edge += sm_edge * sm_strength * 0.3
+            sm_confirms = True
+        else:
+            # Smart money disagrees — veto the trade (strong disagreement)
+            if sm_strength >= 0.6:
+                return None
+            # Mild disagreement — reduce edge
+            total_edge *= 0.6
+
     if total_edge < 0.035:
         return None
 
@@ -447,6 +608,7 @@ def evaluate_market(market: Market, state: BotState) -> dict | None:
         "markov_prob": est.calibrated_probability,
         "confidence": est.confidence,
         "category_mult": cat_mult,
+        "smart_money_confirms": sm_confirms,
     }
 
 
@@ -834,22 +996,28 @@ def build_app(state: BotState, http_session_holder: list) -> Application:
         if not authorized(update):
             return
         n_pos = len(state.positions)
-        total_value = state.cash + sum(p.size_usd for p in state.positions.values())
-        peak = max(total_value, state.capital)
+        total_value = state.total_value
+        peak = state.peak_value
         dd = (peak - total_value) / peak * 100 if peak > 0 else 0
+        cash_ratio = state.cash / max(state.starting_capital, 0.01) * 100
+        daily_loss = 0.0
+        if state.daily_start_value > 0:
+            daily_loss = (state.daily_start_value - total_value) / state.daily_start_value * 100
 
         text = (
             f"<b>Risk Status</b>\n\n"
-            f"Positions: {n_pos}/5 max\n"
-            f"Drawdown: {dd:.1f}% (limit: 30%)\n"
-            f"Cash ratio: {state.cash/max(state.capital,0.01)*100:.0f}%\n\n"
-            f"<b>Risk Rules:</b>\n"
-            f"  Max position: 10% of portfolio\n"
-            f"  Max drawdown: 30%\n"
-            f"  Max concurrent: 5 positions\n"
-            f"  Daily loss limit: 5%\n"
-            f"  Single market cap: 20%\n"
-            f"  Low-cash mode: edge > 6% only\n"
+            f"Positions: {n_pos}/{MAX_CONCURRENT_POSITIONS} max\n"
+            f"Drawdown: {dd:.1f}% (limit: {MAX_DRAWDOWN_PCT*100:.0f}%)\n"
+            f"Daily loss: {daily_loss:.1f}% (limit: {DAILY_LOSS_LIMIT_PCT*100:.0f}%)\n"
+            f"Cash ratio: {cash_ratio:.0f}%\n"
+            f"Peak value: ${peak:.2f}\n\n"
+            f"<b>Risk Rules (enforced):</b>\n"
+            f"  Max position: {MAX_POSITION_PCT*100:.0f}% of portfolio\n"
+            f"  Max drawdown: {MAX_DRAWDOWN_PCT*100:.0f}%\n"
+            f"  Max concurrent: {MAX_CONCURRENT_POSITIONS} positions\n"
+            f"  Daily loss limit: {DAILY_LOSS_LIMIT_PCT*100:.0f}%\n"
+            f"  Low-cash mode: edge > {HIGH_CONVICTION_EDGE*100:.0f}% only "
+            f"(when cash < {HIGH_CONVICTION_CASH_PCT*100:.0f}%)\n"
         )
         await update.message.reply_text(text, parse_mode="HTML")
 
@@ -1107,6 +1275,67 @@ def build_app(state: BotState, http_session_holder: list) -> Application:
             caption=f"Exported {len(trades_data)} trades as {fmt.upper()}.",
         )
 
+    # ── /weights ── Bayesian strategy weight posteriors
+    async def cmd_weights(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        if not authorized(update):
+            return
+        summary = state.bayesian_updater.get_strategy_summary()
+        if not summary:
+            await update.message.reply_text("No strategy data yet. Trades must resolve first.")
+            return
+
+        weights = state.bayesian_updater.get_optimal_weights()
+        lines = ["<b>Bayesian Strategy Weights</b>\n"]
+
+        for name, info in summary.items():
+            ci_lo, ci_hi = info["credible_interval_95"]
+            regime = " [REGIME]" if info["regime_change"] else ""
+            lines.append(
+                f"<b>{name}</b>{regime}\n"
+                f"  Weight: {weights.get(name, 0):.4f}\n"
+                f"  WR: {info['posterior_win_rate']:.3f} "
+                f"[{ci_lo:.3f}, {ci_hi:.3f}]\n"
+                f"  IC: {info['rolling_ic']:+.4f} | "
+                f"Edge: {info['expected_edge']:+.4f}\n"
+                f"  Beta({info['beta_alpha']:.1f}, {info['beta_beta']:.1f}) | "
+                f"N={info['n_observations']}"
+            )
+
+        await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+
+    # ── /smartmoney ── Recent large order flow
+    async def cmd_smartmoney(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        if not authorized(update):
+            return
+        flows = state.smart_money.get_all_flows()
+        if not flows:
+            await update.message.reply_text(
+                "No smart money flow detected yet. Need more orderbook data."
+            )
+            return
+
+        lines = ["<b>Smart Money Flow</b>\n"]
+        # Sort by absolute net flow
+        sorted_flows = sorted(
+            flows.items(), key=lambda x: abs(x[1].net_flow_usd), reverse=True
+        )
+
+        for market_id, flow in sorted_flows[:10]:
+            m = state.markets.get(market_id)
+            question = m.question[:40] if m else market_id[:20]
+            direction = "BUY" if flow.flow_imbalance > 0 else "SELL"
+            lines.append(
+                f"<b>{question}</b>\n"
+                f"  {direction} pressure | Imbalance: {flow.flow_imbalance:+.3f}\n"
+                f"  Net: ${flow.net_flow_usd:+,.0f} | "
+                f"Buys: {flow.n_large_buys} (${flow.buy_volume_usd:,.0f}) | "
+                f"Sells: {flow.n_large_sells} (${flow.sell_volume_usd:,.0f})\n"
+                f"  VWAP B/S: {flow.vwap_buy:.3f}/{flow.vwap_sell:.3f} | "
+                f"Avg: ${flow.avg_order_size:,.0f}"
+            )
+
+        await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+
     # ── Helper: Text sparkline ──
     def _text_sparkline(values: list[float]) -> str:
         """Generate a Unicode sparkline from a list of values."""
@@ -1287,21 +1516,60 @@ async def run_scan(session: aiohttp.ClientSession, state: BotState) -> list[dict
             await asyncio.sleep(0.1)
 
     # 3. Fetch live orderbooks for top markets
+    #    If WSFeed is active, use its snapshots instead of REST polling
     top = sorted(state.markets.values(), key=lambda m: -m.volume_24h)[:30]
     for m in top:
         if not m.token_ids:
             continue
-        book = await fetch_book(session, m.token_ids[0])
-        if book:
-            bids = book.get("bids", [])
-            asks = book.get("asks", [])
-            m.best_bid = float(bids[0]["price"]) if bids else 0
-            m.best_ask = float(asks[0]["price"]) if asks else 1
-            m.mid_price = (m.best_bid + m.best_ask) / 2 if (m.best_bid + m.best_ask) > 0 else m.yes_price
-            m.spread = m.best_ask - m.best_bid
+
+        ws_snap = None
+        if state.ws_feed and state.ws_feed.is_ws_connected:
+            ws_snap = state.ws_feed.get_snapshot(m.token_ids[0])
+
+        if ws_snap:
+            # Use WebSocket snapshot — no REST call needed
+            m.best_bid = ws_snap.best_bid
+            m.best_ask = ws_snap.best_ask
+            m.mid_price = ws_snap.mid_price if ws_snap.mid_price > 0 else m.yes_price
+            m.spread = ws_snap.spread
             if m.mid_price > 0:
                 m.price_history.append(m.mid_price)
-        await asyncio.sleep(0.1)
+            # Ingest bid/ask levels for smart money detection
+            for price, size in ws_snap.bid_levels:
+                state.smart_money.ingest_trade(
+                    m.condition_id, m.token_ids[0], "BUY", price * size, price,
+                )
+            for price, size in ws_snap.ask_levels:
+                state.smart_money.ingest_trade(
+                    m.condition_id, m.token_ids[0], "SELL", price * size, price,
+                )
+        else:
+            book = await fetch_book(session, m.token_ids[0])
+            if book:
+                bids = book.get("bids", [])
+                asks = book.get("asks", [])
+                m.best_bid = float(bids[0]["price"]) if bids else 0
+                m.best_ask = float(asks[0]["price"]) if asks else 1
+                m.mid_price = (m.best_bid + m.best_ask) / 2 if (m.best_bid + m.best_ask) > 0 else m.yes_price
+                m.spread = m.best_ask - m.best_bid
+                if m.mid_price > 0:
+                    m.price_history.append(m.mid_price)
+                # Ingest orderbook levels for smart money detection
+                for b in bids:
+                    price_val = float(b.get("price", 0))
+                    size_val = float(b.get("size", 0))
+                    state.smart_money.ingest_trade(
+                        m.condition_id, m.token_ids[0], "BUY",
+                        price_val * size_val, price_val,
+                    )
+                for a in asks:
+                    price_val = float(a.get("price", 0))
+                    size_val = float(a.get("size", 0))
+                    state.smart_money.ingest_trade(
+                        m.condition_id, m.token_ids[0], "SELL",
+                        price_val * size_val, price_val,
+                    )
+            await asyncio.sleep(0.1)
 
     # 4. Check shadow fills + expire stale unfilled orders
     ORDER_TIMEOUT_S = 600  # Cancel unfilled limit orders after 10 minutes
@@ -1359,19 +1627,72 @@ async def run_scan(session: aiohttp.ClientSession, state: BotState) -> list[dict
                 pnl=round(pnl, 2), mode=state.mode.upper(),
             )
             state.log_trade(trade)
+
+            # --- Bayesian updater: learn from resolved trade ---
+            won = pnl > 0
+            actual_return = pnl / max(pos.size_usd, 0.01)
+            # Update all contributing strategies (attribute to primary)
+            state.bayesian_updater.update("markov_mc", won, actual_return)
+            if pos.direction == "SELL":
+                state.bayesian_updater.update("no_bias", won, actual_return)
+            state.bayesian_updater.update("maker_edge", won, actual_return)
+            # Push updated weights into the combiner
+            state.bayesian_updater.apply_to_combiner(state.combiner)
+
+            # Clean up smart money data for resolved market
+            state.smart_money.clear_market(pos.market_id)
+
             del state.positions[tid]
 
-    # 5. Generate new signals
+    # 5. Generate new signals (with smart money confirmation)
     if not state.kill_switch:
         for m in top:
-            sig = evaluate_market(m, state)
+            sm_sig = state.smart_money.get_signal(m.condition_id, m.mid_price)
+            sig = evaluate_market(m, state, smart_money_signal=sm_sig)
             if sig:
                 signals.append(sig)
 
-        # Execute top signals (max 3 per scan)
+        # Update peak value for risk tracking
+        state.peak_value = max(state.peak_value, state.total_value)
+
+        # Execute top signals (max 3 per scan) with risk checks + book walking
         for sig in sorted(signals, key=lambda s: -s["edge"])[:3]:
             m = sig["market"]
             token_id = m.token_ids[0] if m.token_ids else m.condition_id
+
+            # Risk check (ported from live_paper_trader.py)
+            allowed, reason = check_risk(
+                size_usd=sig["size"],
+                edge=sig["edge"],
+                cash=state.cash,
+                total_value=state.total_value,
+                starting_capital=state.starting_capital,
+                peak_value=state.peak_value,
+                n_positions=len(state.positions),
+                daily_start_value=state.daily_start_value,
+            )
+            if not allowed:
+                logger.info(f"RISK BLOCKED: {reason} | {m.question[:40]}")
+                continue
+
+            # Walk the order book for realistic VWAP fill price
+            entry_price = m.mid_price
+            actual_size = sig["size"]
+            book = await fetch_book(session, token_id)
+            if book:
+                if sig["direction"] == "BUY":
+                    asks = book.get("asks", [])
+                    fill_price, filled_usd = walk_book(asks, sig["size"], "buy")
+                else:
+                    bids = book.get("bids", [])
+                    fill_price, filled_usd = walk_book(bids, sig["size"], "sell")
+
+                if fill_price > 0 and filled_usd > 0:
+                    entry_price = fill_price
+                    actual_size = min(sig["size"], filled_usd)
+                else:
+                    logger.info(f"NO FILL: empty book for {m.question[:40]}")
+                    continue
 
             pos = PaperPosition(
                 token_id=token_id,
@@ -1379,8 +1700,8 @@ async def run_scan(session: aiohttp.ClientSession, state: BotState) -> list[dict
                 question=m.question,
                 category=m.category,
                 direction=sig["direction"],
-                entry_price=m.mid_price,
-                size_usd=sig["size"],
+                entry_price=entry_price,
+                size_usd=actual_size,
                 edge_at_entry=sig["edge"],
                 limit_price=sig["limit_price"],
                 filled=False,
@@ -1388,10 +1709,11 @@ async def run_scan(session: aiohttp.ClientSession, state: BotState) -> list[dict
             )
 
             state.positions[token_id] = pos
-            state.cash -= sig["size"]
+            state.cash -= actual_size
 
     state.signals = signals
     state.snapshot()
+    state.persist_state()
     return signals
 
 
