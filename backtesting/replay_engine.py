@@ -88,6 +88,9 @@ class ReplayTrade:
     exit_price: float = 0.0
     pnl: float = 0.0
     resolved: bool = False
+    eval_latency_ms: float = 0.0  # How long our model took to decide
+    price_at_eval_start: float = 0.0  # Price when we started evaluating
+    latency_slippage: float = 0.0  # Price moved during our evaluation
 
 
 # ─── Replay Engine ────────────────────────────────────────────────
@@ -99,8 +102,12 @@ class ReplayEngine:
     at each timestamp, and exposes it via get_market_state().
     """
 
-    def __init__(self, parquet_path: str, chunk_size: int = 50_000):
-        self.path = parquet_path
+    def __init__(self, parquet_path: str | list[str], chunk_size: int = 50_000):
+        """Initialize with one or multiple parquet files (loaded in order)."""
+        if isinstance(parquet_path, str):
+            self.paths = [parquet_path]
+        else:
+            self.paths = sorted(parquet_path)  # Sort by filename = chronological
         self.chunk_size = chunk_size
         self.markets: dict[str, MarketState] = {}
         self._events: list[dict] = []
@@ -108,50 +115,55 @@ class ReplayEngine:
         self._clock = 0.0
 
     def load_events(self, max_rows: int | None = None) -> int:
-        """Load and parse events from Parquet into chronological order."""
+        """Load and parse events from one or more Parquet files in chronological order."""
         import pyarrow.parquet as pq
 
-        logger.info("Loading %s ...", self.path)
+        logger.info("Loading %d file(s)...", len(self.paths))
         t0 = time.time()
 
-        pf = pq.ParquetFile(self.path)
         all_events = []
         total_rows = 0
 
-        for rg_idx in range(pf.metadata.num_row_groups):
-            rg = pf.read_row_group(rg_idx)
-            df = rg.to_pandas()
-            total_rows += len(df)
+        for fpath in self.paths:
+            logger.info("  Reading %s", Path(fpath).name)
+            pf = pq.ParquetFile(fpath)
 
-            for _, row in df.iterrows():
-                try:
-                    data = json.loads(row["data"]) if isinstance(row["data"], str) else row["data"]
-                    ts = row["timestamp_received"]
-                    if hasattr(ts, "timestamp"):
-                        ts_float = ts.timestamp()
-                    else:
-                        ts_float = float(ts)
+            for rg_idx in range(pf.metadata.num_row_groups):
+                rg = pf.read_row_group(rg_idx)
+                df = rg.to_pandas()
+                total_rows += len(df)
 
-                    all_events.append({
-                        "timestamp": ts_float,
-                        "market_id": row["market_id"],
-                        "update_type": row["update_type"],
-                        "data": data,
-                    })
-                except Exception:
-                    continue
+                for _, row in df.iterrows():
+                    try:
+                        data = json.loads(row["data"]) if isinstance(row["data"], str) else row["data"]
+                        ts = row["timestamp_received"]
+                        if hasattr(ts, "timestamp"):
+                            ts_float = ts.timestamp()
+                        else:
+                            ts_float = float(ts)
 
+                        all_events.append({
+                            "timestamp": ts_float,
+                            "market_id": row["market_id"],
+                            "update_type": row["update_type"],
+                            "data": data,
+                        })
+                    except Exception:
+                        continue
+
+                if max_rows and total_rows >= max_rows:
+                    break
+
+            logger.info("    -> %d events so far", len(all_events))
             if max_rows and total_rows >= max_rows:
                 break
-
-            logger.info("  Row group %d: %d events (total: %d)", rg_idx, len(df), len(all_events))
 
         # Sort by timestamp
         all_events.sort(key=lambda e: e["timestamp"])
         self._events = all_events
 
         elapsed = time.time() - t0
-        logger.info("Loaded %d events in %.1fs", len(self._events), elapsed)
+        logger.info("Loaded %d events from %d files in %.1fs", len(self._events), len(self.paths), elapsed)
         return len(self._events)
 
     def advance_to(self, target_ts: float) -> int:
@@ -530,26 +542,36 @@ def run_replay(
                 trade.entry_price, trade.exit_price,
             )
 
-        # Measure evaluation latency (how long our model takes to decide)
-        eval_start = time.time()
-
         # Evaluate active markets for new trades
         active = engine.get_active_markets(min_updates=50)
         for market in active[:20]:  # Cap evaluations per cycle
+            # Capture price BEFORE evaluation (for latency slippage)
+            pre_eval_prices = {}
+            for tid, book in market.books.items():
+                pre_eval_prices[tid] = book.mid_price
+
+            eval_start = time.time()
             trade = agent.evaluate(market)
+            eval_latency_ms = (time.time() - eval_start) * 1000
+
             if trade and trade_count < 50:  # Max trades per replay
-                eval_latency_ms = (time.time() - eval_start) * 1000
+                # Compute latency slippage: how much price moved during eval
+                pre_price = pre_eval_prices.get(trade.token_id, trade.entry_price)
+                trade.eval_latency_ms = eval_latency_ms
+                trade.price_at_eval_start = pre_price
+                trade.latency_slippage = abs(trade.entry_price - pre_price)
+
                 agent.execute_trade(trade)
                 trade_count += 1
 
-                # Show simulated time and latency
-                from datetime import datetime, timezone
-                sim_time = datetime.fromtimestamp(engine.clock, tz=timezone.utc).strftime("%H:%M:%S.%f")[:-3]
+                from datetime import datetime as dt_, timezone as tz_
+                sim_time = dt_.fromtimestamp(engine.clock, tz=tz_.utc).strftime("%H:%M:%S")
+                slip_bps = trade.latency_slippage * 10000
                 logger.info(
-                    "  [%s] TRADE #%d: %s %s | $%.2f @ %.4f | edge: %.1f%% | latency: %.0fms",
+                    "  [%s] TRADE #%d: %s %s | $%.2f @ %.4f | edge: %.1f%% | latency: %.0fms | slip: %.0fbps",
                     sim_time, trade_count, trade.direction, trade.market_id[:16],
                     trade.size_usd, trade.entry_price, trade.edge * 100,
-                    eval_latency_ms,
+                    eval_latency_ms, slip_bps,
                 )
 
         # Progress update every 10 evals
@@ -569,6 +591,15 @@ def run_replay(
     stats["events_processed"] = n_events
     stats["markets_seen"] = len(engine.markets)
     stats["active_markets"] = len(engine.get_active_markets())
+
+    # Latency stats
+    if agent.trades:
+        latencies = [t.eval_latency_ms for t in agent.trades]
+        slippages = [t.latency_slippage * 10000 for t in agent.trades]  # in bps
+        stats["avg_latency_ms"] = round(np.mean(latencies), 0)
+        stats["max_latency_ms"] = round(max(latencies), 0)
+        stats["avg_slippage_bps"] = round(np.mean(slippages), 1)
+        stats["max_slippage_bps"] = round(max(slippages), 1)
 
     print("\n" + "=" * 60)
     print("  REPLAY RESULTS")
@@ -596,7 +627,7 @@ def run_replay(
 
 def main():
     parser = argparse.ArgumentParser(description="PMXT Replay Engine")
-    parser.add_argument("--file", required=True, help="Path to PMXT Parquet file")
+    parser.add_argument("--file", nargs="+", required=True, help="Path(s) to PMXT Parquet file(s)")
     parser.add_argument("--max-rows", type=int, default=None, help="Limit rows (None=all)")
     parser.add_argument("--capital", type=float, default=1000.0, help="Starting capital")
     parser.add_argument("--eval-every", type=int, default=5000, help="Evaluate every N events")
@@ -604,8 +635,16 @@ def main():
     parser.add_argument("--speed", type=float, default=60.0, help="Playback speed (1=realtime, 60=1min/sec)")
     args = parser.parse_args()
 
+    # Support glob patterns
+    import glob as glob_mod
+    files = []
+    for pattern in args.file:
+        expanded = glob_mod.glob(pattern)
+        files.extend(expanded if expanded else [pattern])
+    files = sorted(set(files))
+
     stats = run_replay(
-        parquet_path=args.file,
+        parquet_path=files if len(files) > 1 else files[0],
         max_rows=args.max_rows,
         capital=args.capital,
         eval_every_n=args.eval_every,
