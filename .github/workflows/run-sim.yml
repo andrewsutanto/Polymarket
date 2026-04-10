@@ -1,0 +1,83 @@
+name: Run Simulation Backtest
+
+on:
+  workflow_dispatch:
+    inputs:
+      hours:
+        description: 'Number of PMXT hours to download (1-24)'
+        required: true
+        default: '3'
+        type: string
+      capital:
+        description: 'Starting capital in USD'
+        required: true
+        default: '1000'
+        type: string
+      max_rows:
+        description: 'Max rows to process (0=unlimited)'
+        required: true
+        default: '0'
+        type: string
+
+jobs:
+  simulate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Download PMXT orderbook data
+        run: |
+          mkdir -p data/pmxt_orderbooks
+          BASE_DATE="2026-04-08"
+          HOURS=${{ github.event.inputs.hours }}
+
+          for h in $(seq -w 6 $((5 + HOURS))); do
+            FILE="polymarket_orderbook_${BASE_DATE}T${h}.parquet"
+            URL="https://r2.pmxt.dev/${FILE}"
+            echo "Downloading ${FILE}..."
+            curl -L -s -o "data/pmxt_orderbooks/${FILE}" "${URL}" -w "  %{size_download} bytes in %{time_total}s\n"
+          done
+
+          echo "Files downloaded:"
+          ls -lh data/pmxt_orderbooks/
+
+      - name: Run simulated environment
+        run: |
+          MAX_ROWS="${{ github.event.inputs.max_rows }}"
+          CAPITAL="${{ github.event.inputs.capital }}"
+
+          ARGS="--file data/pmxt_orderbooks/*.parquet --capital ${CAPITAL} --speed 0 --scan-every 50000"
+          if [ "${MAX_ROWS}" != "0" ]; then
+            ARGS="${ARGS} --max-rows ${MAX_ROWS}"
+          fi
+
+          echo "Running: python backtesting/sim_environment.py ${ARGS}"
+          python backtesting/sim_environment.py ${ARGS} 2>&1 | tee sim_results.txt
+
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: sim-results-${{ github.run_id }}
+          path: sim_results.txt
+          retention-days: 30
+
+      - name: Print summary
+        if: always()
+        run: |
+          echo "## Simulation Results" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          tail -50 sim_results.txt >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
