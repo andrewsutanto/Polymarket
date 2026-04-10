@@ -434,12 +434,20 @@ class TradingBot:
         self.cash = capital
         self.positions: dict[str, BotTrade] = {}
         self.trades: list[BotTrade] = []
-        self._closed_markets: set[str] = set()  # Markets we already traded — no re-entry
-        self.markov = MarkovModel(n_states=10, n_simulations=2000)
-        self.markov.reset()  # Ensure clean state — no cached matrices from prior runs
+        self._closed_markets: set[str] = set()
+        self.markov = MarkovModel(n_states=10, n_simulations=5000)  # ALIGNED: was 2000, bot uses 5000
+        self.markov.reset()
         self.calibrator = BiasCalibrator()
         self._max_trades = 50
-        self._max_positions = 10
+        self._max_positions = 5  # ALIGNED: was 10, bot uses 5
+        # Risk management — aligned with bot.py check_risk()
+        self._max_drawdown_pct = 0.30
+        self._daily_loss_pct = 0.05
+        self._max_position_pct = 0.10
+        self._high_conviction_cash_pct = 0.30
+        self._high_conviction_edge = 0.06
+        self._peak_value = capital
+        self._daily_start_value = capital
 
     def scan_and_trade(self) -> list[BotTrade]:
         """Run one scan cycle — exactly as the live bot would.
@@ -459,14 +467,24 @@ class TradingBot:
         # Step 2: Check exits on existing positions
         self._check_exits()
 
-        # Step 3: Skip if at position limit
+        # Step 3: Risk checks — ALIGNED with bot.py check_risk()
+        total_value = self.cash + sum(t.size_usd for t in self.positions.values())
+        self._peak_value = max(self._peak_value, total_value)
+        drawdown = (self._peak_value - total_value) / self._peak_value if self._peak_value > 0 else 0
+
+        if drawdown >= self._max_drawdown_pct:
+            return []  # Kill switch
         if len(self.positions) >= self._max_positions:
             return []
         if len(self.trades) >= self._max_trades:
             return []
+        if self._daily_start_value > 0:
+            daily_loss = (self._daily_start_value - total_value) / self._daily_start_value
+            if daily_loss >= self._daily_loss_pct:
+                return []
 
         # Step 4: Evaluate candidates
-        for mkt in markets[:30]:  # Top 30 by activity
+        for mkt in markets[:30]:
             mid = mkt["market_id"]
             tid = mkt["token_id"]
             current_price = mkt["mid_price"]
@@ -474,18 +492,17 @@ class TradingBot:
             if mid in self.positions:
                 continue
             if mid in self._closed_markets:
-                continue  # Never re-enter a market we already traded
+                continue
             if current_price < 0.08 or current_price > 0.92:
                 continue
             if mkt["spread"] > 0.10:
                 continue
 
-            # Get price history from "API"
             history = self._api.get_price_history(mid)
             if len(history) < 15:
                 continue
 
-            # ── EVALUATION (this takes real wall-clock time) ──
+            # ── EVALUATION (real wall-clock time) ──
             signal_price = current_price
             eval_start = time.time()
 
@@ -500,16 +517,19 @@ class TradingBot:
             if estimate.confidence < 0.3:
                 continue
 
-            # Compute edge
+            # ALIGNED: Use category multiplier like bot.py (not hardcoded 1.2)
             cal_edge = estimate.calibrated_probability - current_price
+            cat_mult = self.calibrator.get_category_multiplier("other")  # Default; no question text in sim
             no_edge = self.calibrator.get_no_side_edge(current_price)
 
+            # ALIGNED: No maker edge (sim fills as taker at bid/ask)
+            # Bot adds MAKER=0.0112 but that's inconsistent with taker fills
             if cal_edge < 0:
-                total_edge = abs(cal_edge) * 1.2 + no_edge * 0.4
+                total_edge = abs(cal_edge) * cat_mult + no_edge * 0.4
                 direction = "SELL"
                 price_for_kelly = 1.0 - current_price
             elif cal_edge > 0:
-                total_edge = cal_edge * 1.2 * 0.7
+                total_edge = cal_edge * cat_mult * 0.7
                 direction = "BUY"
                 price_for_kelly = current_price
             else:
@@ -518,13 +538,18 @@ class TradingBot:
             if total_edge < 0.035:
                 continue
 
+            # ALIGNED: High-conviction mode when cash is low
+            cash_ratio = self.cash / max(self.capital, 0.01)
+            if cash_ratio < self._high_conviction_cash_pct and total_edge < self._high_conviction_edge:
+                continue
+
             # Volatility filter
             if len(history) >= 20:
                 vol = np.std(history[-20:])
                 if vol > 0.25:
                     continue
 
-            # Kelly sizing
+            # ALIGNED: Kelly sizing with $5 hard cap matching bot
             if price_for_kelly <= 0.01 or price_for_kelly >= 0.99:
                 continue
             odds = (1.0 / price_for_kelly) - 1.0
@@ -534,7 +559,7 @@ class TradingBot:
             kelly = ((p * odds - (1 - p)) / odds) * 0.25
             if kelly <= 0:
                 continue
-            size = max(0.50, min(kelly * self.cash, self.cash * 0.10))
+            size = max(0.50, min(kelly * self.cash, 5.0))  # ALIGNED: $5 hard cap like bot
             if size < 0.50 or self.cash < size:
                 continue
 
@@ -589,7 +614,7 @@ class TradingBot:
                 continue
 
             mid_p = (book["best_bid"] + book["best_ask"]) / 2
-            if mid_p >= 0.97 or mid_p <= 0.03:
+            if mid_p >= 0.98 or mid_p <= 0.02:  # ALIGNED: was 0.97/0.03, bot uses 0.98/0.02
                 resolution = 1.0 if mid_p >= 0.97 else 0.0
 
                 if trade.direction == "BUY":
