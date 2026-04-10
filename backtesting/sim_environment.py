@@ -114,7 +114,12 @@ class MarketSimulator:
         self._total_events_fed = 0
 
     def load(self, parquet_paths: list[str], max_rows: int | None = None) -> int:
-        """Load events from parquet files."""
+        """Load events with FULL JSON data — no field reduction.
+
+        Processes row-group by row-group to avoid the 126s to_pylist() bottleneck.
+        All fields preserved: best_bid, best_ask, token_id, side, change_price,
+        change_size, change_side — identical to what you'd see live.
+        """
         import pyarrow.parquet as pq
 
         all_events = []
@@ -122,33 +127,57 @@ class MarketSimulator:
 
         for fpath in sorted(parquet_paths):
             logger.info("  Loading %s", Path(fpath).name)
-            pf = pq.ParquetFile(fpath)
-            for rg_idx in range(pf.metadata.num_row_groups):
-                rg = pf.read_row_group(rg_idx)
-                df = rg.to_pandas()
-                total += len(df)
+            t0 = time.time()
 
-                for _, row in df.iterrows():
+            pf = pq.ParquetFile(fpath)
+            file_events = 0
+
+            # Process row-group by row-group (each ~1M rows)
+            # This avoids loading entire 23M-row file into Python at once
+            for rg_idx in range(pf.metadata.num_row_groups):
+                rg = pf.read_row_group(rg_idx, columns=["timestamp_received", "market_id", "data"])
+                n = rg.num_rows
+                total += n
+
+                # Convert columns — row groups are ~1M rows, manageable
+                ts_pd = rg.column("timestamp_received").to_pandas()
+                ts_arr = ts_pd.astype("int64").values / 1e9
+                mid_list = rg.column("market_id").to_pylist()
+                data_list = rg.column("data").to_pylist()
+
+                for i in range(n):
+                    raw = data_list[i]
+                    if not raw:
+                        continue
                     try:
-                        data = json.loads(row["data"]) if isinstance(row["data"], str) else row["data"]
-                        ts = row["timestamp_received"]
-                        ts_f = ts.timestamp() if hasattr(ts, "timestamp") else float(ts)
+                        data = json.loads(raw)  # Full JSON — all fields preserved
                         all_events.append({
-                            "ts": ts_f,
-                            "mid": row["market_id"],
+                            "ts": float(ts_arr[i]),
+                            "mid": mid_list[i],
                             "data": data,
                         })
+                        file_events += 1
                     except Exception:
                         continue
 
+                del ts_pd, ts_arr, mid_list, data_list, rg
+
                 if max_rows and total >= max_rows:
                     break
+
+            elapsed = time.time() - t0
+            logger.info("    -> %d events in %.1fs (%.0f rows/sec)",
+                        file_events, elapsed, file_events / max(elapsed, 0.01))
+
             if max_rows and total >= max_rows:
                 break
 
+        # Sort chronologically
         all_events.sort(key=lambda e: e["ts"])
+        if max_rows:
+            all_events = all_events[:max_rows]
         self._events = all_events
-        logger.info("Loaded %d events", len(self._events))
+        logger.info("Loaded %d events total from %d files", len(self._events), len(parquet_paths))
         return len(self._events)
 
     def start(self):
