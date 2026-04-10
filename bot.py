@@ -553,14 +553,16 @@ def evaluate_market(
     cal_edge = est.calibrated_probability - price
     cat_mult = state.calibrator.get_category_multiplier(market.category)
     no_edge = state.calibrator.get_no_side_edge(price)
-    MAKER = 0.0112
+    # NOTE: Maker edge (+1.12%) removed. It was inflating perceived edge
+    # without modeling fill probability. If we implement maker execution
+    # with shadow fills, we can add it back — but only on confirmed fills.
 
     if cal_edge < 0:
-        total_edge = abs(cal_edge) * cat_mult + no_edge * 0.4 + MAKER
+        total_edge = abs(cal_edge) * cat_mult + no_edge * 0.4
         direction = "SELL"
         kelly_price = 1.0 - price
     elif cal_edge > 0:
-        total_edge = cal_edge * cat_mult * 0.7 + MAKER
+        total_edge = cal_edge * cat_mult * 0.7
         direction = "BUY"
         kelly_price = price
     else:
