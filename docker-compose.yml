@@ -1,0 +1,13 @@
+services:
+  bot:
+    build: .
+    container_name: polymarket-bot
+    restart: unless-stopped
+    env_file: .env
+    command: ["--mode", "${BOT_MODE:-paper}", "--capital", "${STARTING_CAPITAL:-50}"]
+    volumes:
+      - ./data:/app/data    # SQLite persistence
+      - ./logs:/app/logs
+    environment:
+      - PYTHONUNBUFFERED=1
+      - SCAN_INTERVAL=${SCAN_INTERVAL:-120}

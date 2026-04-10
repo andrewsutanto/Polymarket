@@ -1,0 +1,15 @@
+.git
+.github
+.claude
+.env
+*.pyc
+__pycache__
+.mypy_cache
+.ruff_cache
+*.egg-info
+.venv
+venv
+data/*.db
+data/*.parquet
+logs/
+*.md

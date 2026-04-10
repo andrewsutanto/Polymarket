@@ -1,15 +1,24 @@
+# Core runtime
 aiohttp>=3.9.0
 aiosqlite>=0.19.0
 numpy>=1.26.0
-scipy>=1.12.0
-matplotlib>=3.8.0
 python-telegram-bot>=21.0
-py-clob-client>=0.15.0
-structlog>=24.1.0
 python-dotenv>=1.0.0
-pandas>=2.1.0
-plotly>=5.18.0
-pyarrow>=14.0.0
 requests>=2.31.0
+
+# Data & analytics
+pandas>=2.1.0
+scipy>=1.12.0
+pyarrow>=14.0.0
+
+# Visualization (used by charts, reports)
+matplotlib>=3.8.0
+plotly>=5.18.0
 rich>=13.7.0
+
+# Live trading (optional -- only needed for live mode)
+py-clob-client>=0.15.0
+
+# Monitoring / logging
+structlog>=24.1.0
 statsmodels>=0.14.0
