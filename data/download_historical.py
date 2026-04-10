@@ -3,11 +3,13 @@
 Sources (in priority order):
 1. Gamma API — all resolved markets with metadata (free, no auth)
 2. CLOB API — price history timeseries per market (free, no auth)
-3. HuggingFace — SII-WANGZJ/Polymarket_data (1.1B trade records)
+3. PMXT Archive — hourly orderbook snapshots in Parquet (free, no auth)
+4. HuggingFace — SII-WANGZJ/Polymarket_data (1.1B trade records)
 
 Usage:
     python data/download_historical.py --source gamma --limit 1000
     python data/download_historical.py --source clob --markets data/resolved_markets.json
+    python data/download_historical.py --source pmxt --days 7
     python data/download_historical.py --source huggingface --dataset trades
 """
 
@@ -305,6 +307,148 @@ def fetch_all_price_histories(
     return total_points
 
 
+# ─── PMXT Archive (orderbook snapshots) ──────────────────────────
+
+PMXT_ARCHIVE = "https://archive.pmxt.dev/Polymarket"
+PMXT_R2_BASE = "https://r2.pmxt.dev"
+PMXT_DIR = DATA_DIR / "pmxt_orderbooks"
+
+
+def list_pmxt_files(max_pages: int = 5) -> list[str]:
+    """Scrape the PMXT archive listing for available Parquet files.
+
+    Returns list of filenames like 'polymarket_orderbook_2026-04-10T14.parquet'.
+    """
+    files = []
+    page = 1
+
+    while page <= max_pages:
+        try:
+            url = f"{PMXT_ARCHIVE}?page={page}"
+            resp = requests.get(url, timeout=30)
+            resp.raise_for_status()
+            text = resp.text
+
+            # Parse parquet filenames from the listing page
+            import re
+            matches = re.findall(
+                r'(polymarket_orderbook_\d{4}-\d{2}-\d{2}T\d{2}\.parquet)',
+                text,
+            )
+            if not matches:
+                break
+
+            files.extend(matches)
+            page += 1
+            time.sleep(0.3)
+
+        except Exception as e:
+            logger.warning("PMXT listing error page %d: %s", page, e)
+            break
+
+    # Deduplicate and sort
+    files = sorted(set(files))
+    logger.info("Found %d PMXT orderbook files", len(files))
+    return files
+
+
+def download_pmxt_file(filename: str, output_dir: Path | None = None) -> Path | None:
+    """Download a single PMXT orderbook Parquet file.
+
+    Files are 442-730 MB each, so this streams to disk.
+    """
+    if output_dir is None:
+        output_dir = PMXT_DIR
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    output_path = output_dir / filename
+    if output_path.exists():
+        logger.info("Already downloaded: %s", filename)
+        return output_path
+
+    url = f"{PMXT_R2_BASE}/{filename}"
+    logger.info("Downloading %s ...", filename)
+
+    try:
+        resp = requests.get(url, stream=True, timeout=120)
+        resp.raise_for_status()
+
+        total = int(resp.headers.get("content-length", 0))
+        downloaded = 0
+
+        with open(output_path, "wb") as f:
+            for chunk in resp.iter_content(chunk_size=8192 * 16):  # 128KB chunks
+                f.write(chunk)
+                downloaded += len(chunk)
+
+        size_mb = downloaded / (1024 * 1024)
+        logger.info("Downloaded %s (%.1f MB)", filename, size_mb)
+        return output_path
+
+    except Exception as e:
+        logger.error("Failed to download %s: %s", filename, e)
+        if output_path.exists():
+            output_path.unlink()
+        return None
+
+
+def download_pmxt_recent(days: int = 3, max_files: int = 72) -> list[Path]:
+    """Download the most recent N days of PMXT orderbook snapshots.
+
+    Args:
+        days: Number of recent days to download.
+        max_files: Maximum files to download (24 per day).
+
+    Returns:
+        List of downloaded file paths.
+    """
+    files = list_pmxt_files(max_pages=days + 1)
+    if not files:
+        logger.warning("No PMXT files found")
+        return []
+
+    # Take the most recent ones
+    recent = files[-max_files:]
+    logger.info("Downloading %d most recent PMXT files...", len(recent))
+
+    downloaded = []
+    for fname in recent:
+        path = download_pmxt_file(fname)
+        if path:
+            downloaded.append(path)
+        time.sleep(0.5)  # Be nice to their R2 bucket
+
+    logger.info("Downloaded %d PMXT orderbook snapshots", len(downloaded))
+    return downloaded
+
+
+def inspect_pmxt_file(filepath: Path) -> dict[str, Any]:
+    """Inspect a PMXT Parquet file and return schema + basic stats.
+
+    Requires: pip install pyarrow or fastparquet
+    """
+    try:
+        import pyarrow.parquet as pq
+
+        pf = pq.ParquetFile(str(filepath))
+        schema = pf.schema_arrow
+        metadata = pf.metadata
+
+        return {
+            "filename": filepath.name,
+            "num_rows": metadata.num_rows,
+            "num_columns": metadata.num_columns,
+            "columns": [str(field) for field in schema],
+            "size_mb": filepath.stat().st_size / (1024 * 1024),
+            "row_groups": metadata.num_row_groups,
+        }
+    except ImportError:
+        logger.warning("pyarrow not installed. Run: pip install pyarrow")
+        return {"error": "pyarrow not installed"}
+    except Exception as e:
+        return {"error": str(e)}
+
+
 def get_db_stats(conn: sqlite3.Connection) -> dict[str, Any]:
     """Get statistics about the local database."""
     stats = {}
@@ -335,9 +479,10 @@ def get_db_stats(conn: sqlite3.Connection) -> dict[str, Any]:
 
 def main():
     parser = argparse.ArgumentParser(description="Download Polymarket historical data")
-    parser.add_argument("--source", choices=["gamma", "clob", "stats"], default="gamma")
+    parser.add_argument("--source", choices=["gamma", "clob", "pmxt", "stats"], default="gamma")
     parser.add_argument("--limit", type=int, default=1000, help="Max markets to fetch")
     parser.add_argument("--category", type=str, default=None, help="Filter by category tag")
+    parser.add_argument("--days", type=int, default=3, help="Days of PMXT data to download")
     parser.add_argument("--db", type=str, default=str(DB_PATH), help="SQLite DB path")
     args = parser.parse_args()
 
@@ -354,9 +499,24 @@ def main():
         points = fetch_all_price_histories(conn, max_markets=args.limit)
         logger.info("Done: %d price points fetched", points)
 
+    elif args.source == "pmxt":
+        logger.info("Downloading PMXT orderbook snapshots (last %d days)...", args.days)
+        downloaded = download_pmxt_recent(days=args.days, max_files=args.days * 24)
+        logger.info("Done: %d files downloaded", len(downloaded))
+        if downloaded:
+            info = inspect_pmxt_file(downloaded[0])
+            logger.info("Sample file schema: %s", json.dumps(info, indent=2))
+
     elif args.source == "stats":
         stats = get_db_stats(conn)
         print(json.dumps(stats, indent=2))
+        # Also check PMXT files
+        if PMXT_DIR.exists():
+            pmxt_files = list(PMXT_DIR.glob("*.parquet"))
+            print(f"\nPMXT orderbook files: {len(pmxt_files)}")
+            if pmxt_files:
+                total_mb = sum(f.stat().st_size for f in pmxt_files) / (1024 * 1024)
+                print(f"PMXT total size: {total_mb:.0f} MB")
 
     conn.close()
 
