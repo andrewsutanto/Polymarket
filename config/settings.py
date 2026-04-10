@@ -67,7 +67,11 @@ POLYMARKET_CHAIN_ID: int = int(os.getenv("POLYMARKET_CHAIN_ID", "137"))
 POLYMARKET_PRIVATE_KEY: str = os.getenv("POLYMARKET_PRIVATE_KEY", "")
 
 # === EXECUTION ===
-ORDER_TIMEOUT: int = 30
+ORDER_TIMEOUT: int = 30  # seconds to wait for fill before cancelling
+ORDER_POLL_INTERVAL: float = 1.0  # initial poll interval (seconds)
+ORDER_POLL_MAX_INTERVAL: float = 5.0  # max poll interval after backoff
+ORDER_POLL_BACKOFF: float = 1.5  # exponential backoff factor
+ORDER_MAX_POLL_ERRORS: int = 5  # consecutive poll errors before abort
 SIMULATED_SLIPPAGE: float = 0.005
 USER_AGENT: str = "(polymarket-scanner, contact@example.com)"
 
