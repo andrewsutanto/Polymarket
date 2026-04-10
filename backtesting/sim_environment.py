@@ -389,7 +389,9 @@ class TradingBot:
         self.cash = capital
         self.positions: dict[str, BotTrade] = {}
         self.trades: list[BotTrade] = []
+        self._closed_markets: set[str] = set()  # Markets we already traded — no re-entry
         self.markov = MarkovModel(n_states=10, n_simulations=2000)
+        self.markov.reset()  # Ensure clean state — no cached matrices from prior runs
         self.calibrator = BiasCalibrator()
         self._max_trades = 50
         self._max_positions = 10
@@ -426,6 +428,8 @@ class TradingBot:
 
             if mid in self.positions:
                 continue
+            if mid in self._closed_markets:
+                continue  # Never re-enter a market we already traded
             if current_price < 0.08 or current_price > 0.92:
                 continue
             if mkt["spread"] > 0.10:
@@ -557,6 +561,7 @@ class TradingBot:
                 trade.pnl = round(pnl, 4)
                 trade.resolved = True
                 self.cash += trade.size_usd + pnl
+                self._closed_markets.add(mid)  # Never re-enter
                 del self.positions[mid]
 
                 sim_ts = datetime.fromtimestamp(
@@ -573,9 +578,30 @@ class TradingBot:
         resolved = [t for t in self.trades if t.resolved]
         total_value = self.cash + sum(t.size_usd for t in self.positions.values())
 
+        # Mark-to-market open positions using last known prices
+        unrealized_pnl = 0.0
+        mtm_details = []
+        for mid, trade in self.positions.items():
+            book = self._api.get_book(trade.token_id)
+            if book:
+                current_mid = (book["best_bid"] + book["best_ask"]) / 2
+                if trade.direction == "BUY":
+                    shares = trade.size_usd / trade.fill_price
+                    mtm = shares * current_mid - trade.size_usd
+                else:
+                    no_price = 1.0 - trade.fill_price
+                    shares = trade.size_usd / no_price if no_price > 0 else 0
+                    current_no = 1.0 - current_mid
+                    mtm = shares * current_no - trade.size_usd
+                unrealized_pnl += mtm
+                mtm_details.append((mid[:16], trade.direction, trade.fill_price, current_mid, round(mtm, 2)))
+
+        total_value = self.cash + sum(t.size_usd for t in self.positions.values()) + unrealized_pnl
+
         stats = {
             "capital": self.capital,
             "cash": round(self.cash, 2),
+            "unrealized_pnl": round(unrealized_pnl, 2),
             "total_value": round(total_value, 2),
             "return_pct": round((total_value - self.capital) / self.capital * 100, 1),
             "total_trades": len(self.trades),
@@ -691,6 +717,29 @@ def run_simulation(
                 f"{t.signal_price:>8.4f} {t.fill_price:>8.4f} "
                 f"{t.slippage_bps:>5.0f}bp {t.latency_ms:>6.0f}ms {pnl_str:>10}"
             )
+
+    # Mark-to-market on open positions
+    report = bot.report()
+    if "mtm_details" not in report:
+        # Re-fetch mtm from report internals
+        pass
+    if bot.positions:
+        print(f"\n  OPEN POSITIONS (mark-to-market):")
+        print(f"  {'Market':<18} {'Dir':<5} {'Entry':>8} {'Current':>8} {'MTM P&L':>10}")
+        print(f"  {'-' * 55}")
+        for mid, trade in bot.positions.items():
+            book = bot._api.get_book(trade.token_id)
+            if book:
+                cur = (book["best_bid"] + book["best_ask"]) / 2
+                if trade.direction == "BUY":
+                    shares = trade.size_usd / trade.fill_price
+                    mtm = shares * cur - trade.size_usd
+                else:
+                    no_p = 1.0 - trade.fill_price
+                    shares = trade.size_usd / no_p if no_p > 0 else 0
+                    cur_no = 1.0 - cur
+                    mtm = shares * cur_no - trade.size_usd
+                print(f"  {mid[:16]:<18} {trade.direction:<5} {trade.fill_price:>8.4f} {cur:>8.4f} ${mtm:>+9.2f}")
 
     return stats
 

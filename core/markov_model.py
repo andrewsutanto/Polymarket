@@ -55,6 +55,11 @@ class MarkovModel:
         self._matrices: dict[str, np.ndarray] = {}
         self._history_lengths: dict[str, int] = {}
 
+    def reset(self) -> None:
+        """Clear all cached matrices and history. Call between sim runs."""
+        self._matrices.clear()
+        self._history_lengths.clear()
+
     @property
     def n_states(self) -> int:
         return self._n_states
