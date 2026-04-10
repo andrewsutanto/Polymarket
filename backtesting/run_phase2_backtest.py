@@ -249,14 +249,23 @@ def run_strategy(
         if len(history) < 15:
             continue
 
-        # Use entry from 60% through history (walk-forward point)
-        entry_idx = int(len(history) * 0.6)
+        # AUDIT FIX: Use fixed lookback instead of percentage-based entry.
+        # The old "60% through timeline" approach required knowing the total
+        # market duration (i.e., resolution date), which is look-ahead bias.
+        # Instead, use the first 50 price points as training data and enter
+        # at point 51. This is equivalent to "enter after observing ~50 hours
+        # of price history" which is knowable in real-time.
+        MIN_TRAIN_POINTS = 50
+        if len(history) < MIN_TRAIN_POINTS + 5:
+            continue
+
+        entry_idx = MIN_TRAIN_POINTS
         current_price = history[entry_idx]
 
         if current_price < 0.08 or current_price > 0.92:
             continue
 
-        # Run Markov on training portion only
+        # Run Markov on training portion only (first 50 points)
         train_history = history[:entry_idx]
         estimate = markov.estimate(
             cid, train_history, current_price,
@@ -315,6 +324,21 @@ def run_strategy(
             else:
                 continue
             if total_edge < 0.035:
+                continue
+
+        elif strategy_name == "naive_favorites":
+            # AUDIT BASELINE: Simply bet on the favorite (side > 0.50).
+            # This measures the base rate from just picking obvious winners.
+            # If our model can't beat this, it has no real alpha.
+            if current_price > 0.50:
+                direction = "BUY"
+                total_edge = current_price - 0.50  # crude edge estimate
+                price_for_kelly = current_price
+            else:
+                direction = "SELL"
+                total_edge = 0.50 - current_price
+                price_for_kelly = 1.0 - current_price
+            if total_edge < 0.03:
                 continue
 
         else:
@@ -475,7 +499,7 @@ def main():
     logger.info(f"Fetched price histories for {fetched} tokens")
 
     # 4. Run strategies on BOTH train and test sets
-    strategies = ["markov_only", "v2_no_maker", "v2_full"]
+    strategies = ["naive_favorites", "markov_only", "v2_no_maker", "v2_full"]
     all_results = []
 
     for strat in strategies:
