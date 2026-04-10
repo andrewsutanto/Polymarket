@@ -1,19 +1,18 @@
 """Combinatorial arbitrage engine — multi-market constraint exploitation.
 
-Implements the core finding from arxiv:2508.03474: $40M extracted from
-Polymarket by detecting probability constraint violations across
-semantically linked markets. Combinatorial arbitrage (73.5% of profits)
-dominates simple rebalancing (26.5%).
+Implements the core finding from arxiv:2508.03474: $39.6M extracted from
+Polymarket via probability constraint violations. $28.8M came from NegRisk
+market rebalancing alone.
 
-Architecture:
-1. Semantic linking: TF-IDF + cosine similarity to cluster related markets
-2. Constraint graph: Build directed graph of logical dependencies
-3. Violation detection: Find where P(A) + P(B) + ... != 1.0 (fee-adjusted)
-4. Optimal sizing: Linear programming for maximum guaranteed profit
+Detection hierarchy (most to least rigorous):
+1. STRUCTURAL: Same event_slug / negRiskMarketID — mathematically proven link
+   P(outcome_1) + P(outcome_2) + ... = 1.0 by contract design
+2. TAG-BASED: Same groupItemTitle or shared tags — high confidence
+3. SEMANTIC: TF-IDF cosine similarity fallback — lowest confidence
 
-Key insight: Markets about the same event (e.g., "Who wins the election?")
-often have outcomes split across multiple binary markets. When their
-implied probabilities don't sum to 1.0 after fees, guaranteed profit exists.
+Key insight: NegRisk markets (multi-outcome events) are the richest source.
+The Gamma API already groups outcomes via event_slug and negRiskMarketID.
+No NLP or LLM needed for the highest-value opportunities.
 """
 
 from __future__ import annotations
@@ -84,10 +83,10 @@ class ArbOpportunity:
 class CombinatorialArbEngine:
     """Detects and sizes arbitrage across semantically linked markets.
 
-    Based on the methodology from arxiv:2508.03474:
-    - Semantic linking via TF-IDF (no external LLM API needed)
-    - Constraint satisfaction for probability violations
-    - Fee-aware profit calculation
+    Detection hierarchy (most to least rigorous):
+    1. STRUCTURAL: event_slug / negRiskMarketID grouping (confidence: 0.99)
+    2. TAG-BASED: shared groupItemTitle / tags (confidence: 0.85)
+    3. SEMANTIC: TF-IDF cosine similarity fallback (confidence: 0.60)
     """
 
     def __init__(
@@ -106,12 +105,21 @@ class CombinatorialArbEngine:
         self._clusters: list[MarketCluster] = []
 
     def build_clusters(self, markets: list[dict[str, Any]]) -> list[MarketCluster]:
-        """Cluster related markets using TF-IDF similarity.
+        """Cluster related markets using a 3-tier detection hierarchy.
+
+        Tier 1 (STRUCTURAL): Markets sharing event_slug or negRiskMarketID
+               are mathematically linked by contract design. Confidence: 0.99
+        Tier 2 (TAG-BASED): Markets sharing groupItemTitle or significant
+               tag overlap. Confidence: 0.85
+        Tier 3 (SEMANTIC): TF-IDF cosine similarity fallback for markets
+               not caught by structural/tag detection. Confidence: 0.60
 
         Args:
             markets: List of market dicts with at minimum:
                 condition_id, question, slug, category, outcomes,
                 outcome_prices, tokens, tags
+                Optional (for structural detection):
+                event_slug, neg_risk_market_id, group_item_title
 
         Returns:
             List of MarketCluster objects.
@@ -119,7 +127,68 @@ class CombinatorialArbEngine:
         if not markets:
             return []
 
-        # Step 1: Build TF-IDF vectors
+        n = len(markets)
+        clusters_map: dict[int, list[int]] = {}  # cluster_id -> market indices
+        cluster_confidence: dict[int, float] = {}  # cluster_id -> confidence
+        cluster_type: dict[int, str] = {}  # cluster_id -> detection method
+        assigned: set[int] = set()
+        cluster_counter = 0
+
+        # ── Tier 1: STRUCTURAL (event_slug / negRiskMarketID) ────────
+        # These are mathematically guaranteed links — the contract enforces
+        # that outcomes within the same event sum to 1 at settlement.
+        event_groups: dict[str, list[int]] = defaultdict(list)
+        negrisk_groups: dict[str, list[int]] = defaultdict(list)
+
+        for i, m in enumerate(markets):
+            event_slug = m.get("event_slug", "") or m.get("eventSlug", "")
+            neg_risk_id = m.get("neg_risk_market_id", "") or m.get("negRiskMarketID", "")
+
+            if neg_risk_id:
+                negrisk_groups[neg_risk_id].append(i)
+            elif event_slug:
+                event_groups[event_slug].append(i)
+
+        # NegRisk markets first (highest value — $28.8M of $39.6M in paper)
+        for nrid, indices in negrisk_groups.items():
+            if len(indices) >= 2:
+                clusters_map[cluster_counter] = indices
+                cluster_confidence[cluster_counter] = 0.99
+                cluster_type[cluster_counter] = "negrisk_structural"
+                for i in indices:
+                    assigned.add(i)
+                cluster_counter += 1
+
+        # Event-slug groups
+        for slug, indices in event_groups.items():
+            unassigned = [i for i in indices if i not in assigned]
+            if len(unassigned) >= 2:
+                clusters_map[cluster_counter] = unassigned
+                cluster_confidence[cluster_counter] = 0.95
+                cluster_type[cluster_counter] = "event_structural"
+                for i in unassigned:
+                    assigned.add(i)
+                cluster_counter += 1
+
+        # ── Tier 2: TAG-BASED (groupItemTitle / tag overlap) ─────────
+        group_title_map: dict[str, list[int]] = defaultdict(list)
+        for i, m in enumerate(markets):
+            if i in assigned:
+                continue
+            title = m.get("group_item_title", "") or m.get("groupItemTitle", "")
+            if title:
+                group_title_map[title].append(i)
+
+        for title, indices in group_title_map.items():
+            if len(indices) >= 2:
+                clusters_map[cluster_counter] = indices
+                cluster_confidence[cluster_counter] = 0.85
+                cluster_type[cluster_counter] = "tag_based"
+                for i in indices:
+                    assigned.add(i)
+                cluster_counter += 1
+
+        # ── Tier 3: SEMANTIC (TF-IDF fallback) ───────────────────────
         docs = []
         for m in markets:
             text = self._normalize_text(m.get("question", ""))
@@ -128,12 +197,6 @@ class CombinatorialArbEngine:
 
         self._build_idf(docs)
         tfidf_vectors = [self._tfidf_vector(d) for d in docs]
-
-        # Step 2: Find related market pairs via cosine similarity
-        n = len(markets)
-        clusters_map: dict[int, list[int]] = {}  # cluster_id -> market indices
-        assigned: set[int] = set()
-        cluster_counter = 0
 
         for i in range(n):
             if i in assigned:
@@ -145,33 +208,34 @@ class CombinatorialArbEngine:
             for j in range(i + 1, n):
                 if j in assigned:
                     continue
-
-                # Must be same category for plausible linkage
                 if markets[i].get("category", "") != markets[j].get("category", ""):
                     continue
 
                 sim = self._cosine_similarity(tfidf_vectors[i], tfidf_vectors[j])
-                if sim >= 0.45:  # threshold for semantic relatedness
+                if sim >= 0.45:
                     group.append(j)
                     assigned.add(j)
 
             if len(group) >= 2:
                 clusters_map[cluster_counter] = group
+                cluster_confidence[cluster_counter] = 0.60
+                cluster_type[cluster_counter] = "semantic_tfidf"
                 cluster_counter += 1
 
-        # Step 3: Also detect single-market rebalancing (YES+NO != 1)
+        # ── Also detect single-market rebalancing (YES+NO != 1) ──────
         for i in range(n):
             if i not in assigned:
-                # Single market — check for rebalancing arb
                 m = markets[i]
                 prices = m.get("outcome_prices", [])
                 if len(prices) >= 2:
                     total = sum(prices)
-                    if abs(total - 1.0) > 0.02:  # more than 2% deviation
+                    if abs(total - 1.0) > 0.02:
                         clusters_map[cluster_counter] = [i]
+                        cluster_confidence[cluster_counter] = 0.95
+                        cluster_type[cluster_counter] = "rebalancing"
                         cluster_counter += 1
 
-        # Step 4: Build MarketCluster objects
+        # ── Build MarketCluster objects ──────────────────────────────
         self._clusters = []
         for cid, indices in clusters_map.items():
             outcomes = []
@@ -186,8 +250,9 @@ class CombinatorialArbEngine:
                 yes_price = prices[0] if len(prices) > 0 else 0.5
                 no_price = prices[1] if len(prices) > 1 else 1.0 - yes_price
 
-                # Primary outcome (YES side)
                 token_id = tokens[0].get("token_id", "") if tokens else ""
+                if isinstance(token_id, dict):
+                    token_id = token_id.get("token_id", "")
                 outcomes.append(MarketOutcome(
                     condition_id=m.get("condition_id", ""),
                     token_id=token_id,
@@ -202,23 +267,25 @@ class CombinatorialArbEngine:
                 ))
                 questions.append(m.get("question", ""))
 
-            # Determine link confidence from average pairwise similarity
-            avg_sim = 0.0
-            count = 0
-            for a in range(len(indices)):
-                for b in range(a + 1, len(indices)):
-                    avg_sim += self._cosine_similarity(
-                        tfidf_vectors[indices[a]], tfidf_vectors[indices[b]]
-                    )
-                    count += 1
-            avg_sim = avg_sim / count if count > 0 else 0.8
+            # Use pre-computed confidence from detection tier
+            confidence = cluster_confidence.get(cid, 0.60)
+            detection = cluster_type.get(cid, "unknown")
+            ctype = "rebalancing" if len(indices) == 1 else "mutex"
+
+            desc_prefix = {
+                "negrisk_structural": "NegRisk",
+                "event_structural": "Event",
+                "tag_based": "Tag",
+                "semantic_tfidf": "Semantic",
+                "rebalancing": "Rebalance",
+            }.get(detection, "Unknown")
 
             cluster = MarketCluster(
                 cluster_id=f"cluster_{cid}",
-                description=f"Related: {'; '.join(q[:50] for q in questions[:3])}",
+                description=f"[{desc_prefix}] {'; '.join(q[:50] for q in questions[:3])}",
                 outcomes=outcomes,
-                constraint_type="mutex" if len(indices) > 1 else "rebalancing",
-                link_confidence=min(avg_sim + 0.1, 1.0),
+                constraint_type=ctype,
+                link_confidence=confidence,
             )
             self._clusters.append(cluster)
 
@@ -489,7 +556,23 @@ class CombinatorialArbEngine:
         return dot / (norm_a * norm_b)
 
     def get_stats(self) -> dict[str, Any]:
-        """Return engine statistics."""
+        """Return engine statistics with detection tier breakdown."""
+        tier_counts: dict[str, int] = defaultdict(int)
+        for c in self._clusters:
+            # Extract tier from description prefix
+            if c.description.startswith("[NegRisk]"):
+                tier_counts["structural_negrisk"] += 1
+            elif c.description.startswith("[Event]"):
+                tier_counts["structural_event"] += 1
+            elif c.description.startswith("[Tag]"):
+                tier_counts["tag_based"] += 1
+            elif c.description.startswith("[Semantic]"):
+                tier_counts["semantic_tfidf"] += 1
+            elif c.description.startswith("[Rebalance]"):
+                tier_counts["rebalancing"] += 1
+            else:
+                tier_counts["unknown"] += 1
+
         return {
             "total_clusters": len(self._clusters),
             "mutex_clusters": sum(
@@ -500,6 +583,12 @@ class CombinatorialArbEngine:
             ),
             "avg_cluster_size": (
                 sum(len(c.outcomes) for c in self._clusters) / len(self._clusters)
+                if self._clusters
+                else 0
+            ),
+            "detection_tiers": dict(tier_counts),
+            "avg_confidence": (
+                sum(c.link_confidence for c in self._clusters) / len(self._clusters)
                 if self._clusters
                 else 0
             ),

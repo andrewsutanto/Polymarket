@@ -99,6 +99,10 @@ class Market:
     best_bid: float = 0.0
     best_ask: float = 1.0
     price_history: list[float] = field(default_factory=list)
+    # Structural fields for combinatorial arbitrage (from Gamma API)
+    event_slug: str = ""           # Groups outcomes of same event
+    neg_risk_market_id: str = ""   # NegRisk contract grouping ($28.8M source)
+    group_item_title: str = ""     # UI grouping title
 
 
 @dataclass
@@ -1215,6 +1219,10 @@ async def run_scan(session: aiohttp.ClientSession, state: BotState) -> list[dict
             yes_price=prices[0] if prices else 0,
             no_price=prices[1] if len(prices) > 1 else 0,
             mid_price=prices[0] if prices else 0,
+            # Structural fields for rigorous combinatorial arb detection
+            event_slug=raw.get("eventSlug", "") or "",
+            neg_risk_market_id=raw.get("negRiskMarketID", "") or "",
+            group_item_title=raw.get("groupItemTitle", "") or "",
         )
 
         # Preserve history from previous scans
