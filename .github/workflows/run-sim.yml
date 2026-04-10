@@ -6,7 +6,7 @@ on:
       hours:
         description: 'Number of PMXT hours to download (1-24)'
         required: true
-        default: '3'
+        default: '7'
         type: string
       capital:
         description: 'Starting capital in USD'
@@ -20,23 +20,11 @@ on:
         type: string
 
 jobs:
-  simulate:
+  # Download data once, share via artifact
+  download:
     runs-on: ubuntu-latest
-    timeout-minutes: 180
-
+    timeout-minutes: 30
     steps:
-      - name: Checkout repo
-        uses: actions/checkout@v4
-
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-          cache: 'pip'
-
-      - name: Install dependencies
-        run: pip install -r requirements.txt
-
       - name: Download PMXT orderbook data
         run: |
           mkdir -p data/pmxt_orderbooks
@@ -48,46 +36,94 @@ jobs:
             FILE="polymarket_orderbook_${BASE_DATE}T${h}.parquet"
             URL="https://r2.pmxt.dev/${FILE}"
             echo "Downloading ${FILE}..."
-            curl -L -f -o "data/pmxt_orderbooks/${FILE}" "${URL}" -w "  %{size_download} bytes in %{time_total}s\n"
-            if [ $? -ne 0 ]; then
-              echo "ERROR: Failed to download ${FILE}"
-              rm -f "data/pmxt_orderbooks/${FILE}"
-            fi
+            curl -L -f -o "data/pmxt_orderbooks/${FILE}" "${URL}" -w "  %{size_download} bytes in %{time_total}s\n" || rm -f "data/pmxt_orderbooks/${FILE}"
           done
 
-          echo "Files downloaded:"
           ls -lh data/pmxt_orderbooks/
           FILE_COUNT=$(ls data/pmxt_orderbooks/*.parquet 2>/dev/null | wc -l)
-          if [ "$FILE_COUNT" -eq 0 ]; then
-            echo "ERROR: No parquet files downloaded!"
-            exit 1
-          fi
+          echo "Downloaded ${FILE_COUNT} files"
+          [ "$FILE_COUNT" -gt 0 ] || exit 1
 
-      - name: Run simulated environment
-        run: |
-          MAX_ROWS="${{ github.event.inputs.max_rows }}"
-          CAPITAL="${{ github.event.inputs.capital }}"
-
-          ARGS="--file data/pmxt_orderbooks/*.parquet --capital ${CAPITAL} --speed 0 --scan-every 50000"
-          if [ "${MAX_ROWS}" != "0" ]; then
-            ARGS="${ARGS} --max-rows ${MAX_ROWS}"
-          fi
-
-          echo "Running: python backtesting/sim_environment.py ${ARGS}"
-          python backtesting/sim_environment.py ${ARGS} 2>&1 | tee sim_results.txt
-
-      - name: Upload results
-        uses: actions/upload-artifact@v4
-        if: always()
+      - uses: actions/upload-artifact@v4
         with:
-          name: sim-results-${{ github.run_id }}
-          path: sim_results.txt
-          retention-days: 30
+          name: pmxt-data
+          path: data/pmxt_orderbooks/
+          retention-days: 1
 
-      - name: Print summary
-        if: always()
+  # Run BOTH strategies in parallel on same data
+  calibration:
+    needs: download
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.11', cache: 'pip' }
+      - run: pip install -r requirements.txt
+      - uses: actions/download-artifact@v4
+        with: { name: pmxt-data, path: data/pmxt_orderbooks/ }
+      - name: Run CALIBRATION strategy
         run: |
-          echo "## Simulation Results" >> $GITHUB_STEP_SUMMARY
+          ARGS="--file data/pmxt_orderbooks/*.parquet --capital ${{ github.event.inputs.capital }} --speed 0 --scan-every 50000 --strategy calibration"
+          [ "${{ github.event.inputs.max_rows }}" != "0" ] && ARGS="$ARGS --max-rows ${{ github.event.inputs.max_rows }}"
+          python backtesting/sim_environment.py $ARGS 2>&1 | tee results.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: { name: results-calibration, path: results.txt, retention-days: 30 }
+      - if: always()
+        run: |
+          echo "## CALIBRATION Strategy" >> $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY
-          tail -50 sim_results.txt >> $GITHUB_STEP_SUMMARY
+          tail -60 results.txt >> $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY
+
+  markov:
+    needs: download
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.11', cache: 'pip' }
+      - run: pip install -r requirements.txt
+      - uses: actions/download-artifact@v4
+        with: { name: pmxt-data, path: data/pmxt_orderbooks/ }
+      - name: Run MARKOV strategy
+        run: |
+          ARGS="--file data/pmxt_orderbooks/*.parquet --capital ${{ github.event.inputs.capital }} --speed 0 --scan-every 50000 --strategy markov"
+          [ "${{ github.event.inputs.max_rows }}" != "0" ] && ARGS="$ARGS --max-rows ${{ github.event.inputs.max_rows }}"
+          python backtesting/sim_environment.py $ARGS 2>&1 | tee results.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: { name: results-markov, path: results.txt, retention-days: 30 }
+      - if: always()
+        run: |
+          echo "## MARKOV Strategy" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          tail -60 results.txt >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+
+  # Compare side by side
+  compare:
+    needs: [calibration, markov]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { name: results-calibration, path: results/ }
+      - run: mv results/results.txt results/calibration.txt
+      - uses: actions/download-artifact@v4
+        with: { name: results-markov, path: results/ }
+      - run: mv results/results.txt results/markov.txt 2>/dev/null || true
+      - name: Side-by-side comparison
+        run: |
+          echo "## Side-by-Side Comparison" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          for f in results/*.txt; do
+            STRAT=$(basename $f .txt)
+            echo "### ${STRAT^^}" >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            grep -A 20 "SIMULATION RESULTS" $f | head -20 >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+          done
