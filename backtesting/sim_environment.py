@@ -119,7 +119,12 @@ class MarketSimulator:
         Processes row-group by row-group to avoid the 126s to_pylist() bottleneck.
         All fields preserved: best_bid, best_ask, token_id, side, change_price,
         change_size, change_side — identical to what you'd see live.
+
+        Clears previous events to free memory. Market state is preserved.
         """
+        # Free previous events (market state in self._markets is kept)
+        self._events.clear()
+        self._event_idx = 0
         import pyarrow.parquet as pq
 
         all_events = []
@@ -141,7 +146,8 @@ class MarketSimulator:
 
                 # Convert columns — row groups are ~1M rows, manageable
                 ts_pd = rg.column("timestamp_received").to_pandas()
-                ts_arr = ts_pd.astype("int64").values / 1e9
+                # Timestamps are millisecond-precision (not nanoseconds)
+                ts_arr = ts_pd.astype("int64").values / 1e3  # ms -> seconds
                 mid_list = rg.column("market_id").to_pylist()
                 data_list = rg.column("data").to_pylist()
 
@@ -673,55 +679,65 @@ def run_simulation(
 ) -> dict:
     """Run the full simulated environment.
 
-    The orchestrator:
-    1. Creates the simulator (data source)
-    2. Creates the bot (isolated consumer)
-    3. Advances the simulator
-    4. Tells the bot to scan (bot calls simulator API)
-    5. Repeat until data exhausted
+    Processes files ONE AT A TIME to stay within memory limits.
+    Market state and bot state carry forward between files.
+    This means a 7GB RAM machine can handle any number of files.
     """
-    # Create components
     sim = MarketSimulator(speed=speed)
-    n = sim.load(parquet_paths, max_rows=max_rows)
-    if n == 0:
-        return {"error": "No events"}
-
     bot = TradingBot(sim, capital=capital)
 
     mode = f"REALTIME {speed}x" if speed > 0 else "FAST (real latency, no wait)"
     logger.info("=" * 70)
     logger.info("  SIMULATED LIVE ENVIRONMENT")
-    logger.info("  Events: %d | Capital: $%.0f | Mode: %s", n, capital, mode)
+    logger.info("  Files: %d | Capital: $%.0f | Mode: %s", len(parquet_paths), capital, mode)
     logger.info("  Bot sees ONLY current market state (no future data)")
     logger.info("  Fills at ACTUAL book price at fill time (not eval time)")
+    logger.info("  Memory-safe: processes one file at a time")
     logger.info("=" * 70)
 
-    sim.start()
     t0 = time.time()
-    cycle = 0
+    total_events = 0
+    file_num = 0
 
-    while sim.tick():
-        cycle += 1
+    for fpath in sorted(parquet_paths):
+        file_num += 1
+        logger.info("--- File %d/%d: %s ---", file_num, len(parquet_paths), Path(fpath).name)
 
-        # Bot scans every scan_interval_events
-        if cycle % (scan_interval_events // 5000) == 0:
-            bot.scan_and_trade()
+        # Load ONE file into the simulator (clears previous events, keeps market state)
+        n = sim.load([fpath], max_rows=max_rows)
+        if n == 0:
+            continue
+        total_events += n
 
-        # Progress
-        if cycle % 50 == 0:
-            pct = sim.progress * 100
-            sim_time = sim.get_sim_time_str()
-            logger.info(
-                "  [%.0f%%] %s | %d markets | %d trades | $%.0f cash | %d open",
-                pct, sim_time, sim.total_markets, len(bot.trades),
-                bot.cash, len(bot.positions),
-            )
+        if not sim._started:
+            sim.start()
+
+        cycle = 0
+        while sim.tick():
+            cycle += 1
+
+            if cycle % (scan_interval_events // 5000) == 0:
+                bot.scan_and_trade()
+
+            if cycle % 50 == 0:
+                pct = sim.progress * 100
+                sim_time = sim.get_sim_time_str()
+                logger.info(
+                    "  [%.0f%%] %s | %d markets | %d trades | $%.0f cash | %d open",
+                    pct, sim_time, sim.total_markets, len(bot.trades),
+                    bot.cash, len(bot.positions),
+                )
+
+        logger.info(
+            "  File done: %d events | %d markets | %d trades",
+            n, sim.total_markets, len(bot.trades),
+        )
 
     elapsed = time.time() - t0
     stats = bot.report()
     stats["sim_duration"] = sim.get_sim_time_str()
     stats["wall_time_s"] = round(elapsed, 1)
-    stats["events_processed"] = n
+    stats["events_processed"] = total_events
     stats["markets_seen"] = sim.total_markets
 
     # Final report
