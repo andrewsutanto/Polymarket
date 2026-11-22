@@ -13616,3 +13616,64 @@ Automated daily research + simulation pipeline. Entries added by scheduled agent
 16:34:58 [INFO] Total raw trades fetched: 0
 16:34:58 [ERROR] No trades returned. The CLOB API may not expose wallet addresses in this endpoint. Consider using Polygon RPC or Dune Analytics as alternative data sources.
 ```
+
+## 2026-11-22 — Automated Pipeline Run
+
+**New PMXT files:** 0
+
+### calibration strategy
+```
+  SIMULATION RESULTS
+======================================================================
+  Capital                        1000.0
+  Cash                           990.0
+  Unrealized Pnl                 -0.09
+  Total Value                    999.91
+  Return Pct                     -0.0
+  Total Trades                   2
+  Resolved                       0
+  Open Positions                 2
+  Avg Latency Ms                 0.0
+  Max Latency Ms                 0.1
+  Avg Slippage Bps               100.0
+  Max Slippage Bps               150.0
+  Sim Duration                   2026-04-08 08:50:29 UTC
+```
+### markov strategy
+```
+  SIMULATION RESULTS
+======================================================================
+  Capital                        1000.0
+  Cash                           979.86
+  Unrealized Pnl                 -1.2
+  Total Value                    998.66
+  Return Pct                     -0.1
+  Total Trades                   6
+  Resolved                       2
+  Open Positions                 4
+  Wins                           1
+  Losses                         1
+  Win Rate                       50.0
+  Total Pnl                      -0.14
+  Avg Pnl                        -0.07
+```
+### Wallet screening
+```
+16:51:42 [INFO] === Polymarket Wallet Screener ===
+16:51:42 [INFO]   Min trades: 20
+16:51:42 [INFO]   Min win rate: 55%
+16:51:42 [INFO]   Min PnL: $1000
+16:51:42 [INFO]   Fetch limit: 1000 trades
+16:51:42 [INFO]   Top wallets: 20
+16:51:42 [INFO]   Markets to scan: 30
+16:51:42 [INFO] Fetching active markets...
+16:51:42 [INFO] Found 60 token IDs across 30 markets
+16:51:48 [INFO]   Fetched 10/60 tokens, 0 trades so far...
+16:51:54 [INFO]   Fetched 20/60 tokens, 0 trades so far...
+16:52:01 [INFO]   Fetched 30/60 tokens, 0 trades so far...
+16:52:08 [INFO]   Fetched 40/60 tokens, 0 trades so far...
+16:52:14 [INFO]   Fetched 50/60 tokens, 0 trades so far...
+16:52:21 [INFO]   Fetched 60/60 tokens, 0 trades so far...
+16:52:21 [INFO] Total raw trades fetched: 0
+16:52:21 [ERROR] No trades returned. The CLOB API may not expose wallet addresses in this endpoint. Consider using Polygon RPC or Dune Analytics as alternative data sources.
+```
